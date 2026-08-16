@@ -21,8 +21,10 @@ class ModelConfig:
         self.PROPAINTER_MODEL_DIR = os.path.join(BASE_DIR,'models', 'propainter')
         if config.subtitleDetectMode.value == SubtitleDetectMode.PP_OCRv5_MOBILE:
             self.DET_MODEL_DIR = os.path.join(BASE_DIR,'models', 'V5', 'ch_det_fast')
+            self.REC_MODEL_DIR = os.path.join(BASE_DIR,'models', 'V5', 'ch_rec_fast')
         elif config.subtitleDetectMode.value == SubtitleDetectMode.PP_OCRv5_SERVER:
             self.DET_MODEL_DIR = os.path.join(BASE_DIR, 'models', 'V5', 'ch_det')
+            self.REC_MODEL_DIR = os.path.join(BASE_DIR, 'models', 'V5', 'ch_rec')
         else:
             raise ValueError(f"Invalid subtitle detect mode: {config.subtitleDetectMode.value}")
         self.DET_MODEL_NAME = _MODEL_NAME_MAP[config.subtitleDetectMode.value]

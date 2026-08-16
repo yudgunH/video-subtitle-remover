@@ -1,17 +1,22 @@
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backend.tools.app_paths import initialize_runtime_environment, get_data_directory
+
+initialize_runtime_environment()
+
 import gc
 import torch
 import shutil
 import traceback
 import subprocess
-import os
 from pathlib import Path
 import threading
 import cv2
-import sys
 from functools import cached_property
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.config import *
 from backend.tools.hardware_accelerator import HardwareAccelerator
 from backend.tools.common_tools import is_video_or_image, is_image_file, get_readable_path, read_image
@@ -22,6 +27,7 @@ from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
 from backend.tools.inpaint_tools import (
     create_mask,
+    create_text_box_mask,
     create_caption_text_union_mask,
     create_chinese_text_mask,
     create_chinese_text_union_mask,
@@ -73,17 +79,47 @@ class SubtitleRemover:
         self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         # 创建视频临时对象，windows下delete=True会有permission denied的报错
-        self.video_temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        self.video_temp_file = tempfile.NamedTemporaryFile(
+            suffix='.mp4', delete=False, dir=str(get_data_directory("temp"))
+        )
+        # OpenCV exposes only an average FPS for VFR input. Probe the original
+        # presentation timestamps so the processed frames keep local A/V sync.
+        frame_timing = None
+        if not self.is_picture:
+            frame_timing = FFmpegCLI.instance().probe_video_frame_timing(
+                self.video_path, expected_frame_count=self.frame_count
+            )
+        writer_fps = (
+            frame_timing.nominal_fps if frame_timing is not None else self.fps
+        )
         # 创建视频写对象（使用 FFmpeg libx264 编码，比 mp4v 质量更好、文件更小）
         try:
-            self.video_writer = FFmpegVideoWriter(get_readable_path(self.video_temp_file.name), self.fps, self.size)
+            self.video_writer = FFmpegVideoWriter(
+                get_readable_path(self.video_temp_file.name),
+                writer_fps,
+                self.size,
+                source_timestamps=(
+                    frame_timing.timestamps if frame_timing is not None else None
+                ),
+                source_duration=(
+                    frame_timing.duration if frame_timing is not None else None
+                ),
+            )
+            if frame_timing is not None and frame_timing.variable_frame_rate:
+                print(
+                    "Variable-frame-rate input detected: preserving source "
+                    f"PTS at {frame_timing.nominal_fps:g} fps cadence."
+                )
         except Exception:
             self.video_writer = cv2.VideoWriter(get_readable_path(self.video_temp_file.name), cv2.VideoWriter_fourcc(*'mp4v'), self.fps, self.size)
-        self.video_out_path = os.path.abspath(os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub.mp4'))
+        output_directory = get_data_directory("output")
+        self.video_out_path = os.path.abspath(
+            os.path.join(output_directory, f'{self.vd_name}_no_sub.mp4')
+        )
         self.propainter_inpaint = None
         self.ext = os.path.splitext(vd_path)[-1]
         if self.is_picture:
-            pic_dir = os.path.join(os.path.dirname(self.video_path), 'no_sub')
+            pic_dir = os.path.join(output_directory, 'images')
             if not os.path.exists(pic_dir):
                 os.makedirs(pic_dir)
             self.video_out_path = os.path.join(pic_dir, f'{self.vd_name}{self.ext}')
@@ -369,6 +405,7 @@ class SubtitleRemover:
                 seen_caption_references = set()
                 chinese_mask_references = []
                 seen_chinese_references = set()
+                chinese_timeline_coordinates = []
                 # 1. 获取当前批次的mask坐标全集
                 for mask_index in range(start_frame_index, end_frame_index + 1):
                     if mask_index in sub_list.keys():
@@ -379,12 +416,10 @@ class SubtitleRemover:
                                 continue
                             if area not in mask_area_coordinates:
                                 mask_area_coordinates.append(area)
-                            if (
-                                SubtitleDetect._box_center_in_areas(
-                                    area, self.caption_areas
-                                )
-                                and area not in caption_area_coordinates
-                            ):
+                            in_caption_area = SubtitleDetect._box_center_in_areas(
+                                area, self.caption_areas
+                            )
+                            if in_caption_area and area not in caption_area_coordinates:
                                 caption_area_coordinates.append(area)
                                 frame_offset = mask_index - start_frame_index
                                 if (
@@ -395,6 +430,11 @@ class SubtitleRemover:
                                     caption_mask_references.append(
                                         (frames_need_inpaint[frame_offset], area)
                                     )
+                            elif (
+                                not in_caption_area
+                                and area not in chinese_timeline_coordinates
+                            ):
+                                chinese_timeline_coordinates.append(area)
                     for record in translation_records.get(mask_index, []):
                         area = tuple(record["box"])
                         xmin, xmax, ymin, ymax = area
@@ -427,6 +467,18 @@ class SubtitleRemover:
                         ],
                         size=self.mask_size,
                     )
+                    if config.translateNonSubtitleCjk.value:
+                        # These boxes already belong to stable, high-confidence
+                        # Chinese tracks. Close the complete interpolated box so
+                        # original glyphs cannot flash below a translation.
+                        chinese_mask = cv2.bitwise_or(
+                            chinese_mask,
+                            create_text_box_mask(
+                                self.mask_size,
+                                chinese_timeline_coordinates,
+                                padding=5,
+                            ),
+                        )
                     mask = cv2.bitwise_or(chinese_mask, caption_mask)
                     model_mask = create_mask(
                         self.mask_size,
@@ -762,42 +814,34 @@ class SubtitleRemover:
         self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
 
     def merge_audio_to_video(self):
-        # 创建音频临时对象，windows下delete=True会有permission denied的报错
-        temp = tempfile.NamedTemporaryFile(suffix='.aac', delete=False)
-        audio_extract_command = [FFmpegCLI.instance().ffmpeg_path,
-                                 "-y", "-i", self.video_path,
-                                 "-acodec", "copy",
-                                 "-vn", "-loglevel", "error", temp.name]
-        use_shell = True if os.name == "nt" else False
+        # Mux directly from the source container. Extracting raw AAC first
+        # discards its original timestamps and can introduce another offset.
+        audio_merge_command = [
+            FFmpegCLI.instance().ffmpeg_path,
+            "-y", "-copyts", "-start_at_zero",
+            "-i", self.video_temp_file.name,
+            "-i", self.video_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-map_metadata", "1",
+            "-loglevel", "error",
+            self.video_out_path,
+        ]
         try:
-            subprocess.check_output(audio_extract_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
+            subprocess.check_output(
+                audio_merge_command,
+                stdin=subprocess.DEVNULL,
+                shell=False,
+                timeout=600,
+            )
         except Exception as e:
             traceback.print_exc()
-            self.append_output(tr['Main']['FailToExtractAudio'].format(str(e)))
-            return
+            self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
         else:
-            if os.path.exists(self.video_temp_file.name):
-                audio_merge_command = [FFmpegCLI.instance().ffmpeg_path,
-                                       "-y", "-i", self.video_temp_file.name,
-                                       "-i", temp.name,
-                                       "-vcodec", "copy",
-                                       "-acodec", "copy",
-                                       "-loglevel", "error", self.video_out_path]
-                try:
-                    subprocess.check_output(audio_merge_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
-                except Exception as e:
-                    traceback.print_exc()
-                    self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
-                    return
-            if os.path.exists(temp.name):
-                try:
-                    os.remove(temp.name)
-                except Exception:
-                    #ignore
-                    pass
             self.is_successful_merged = True
         finally:
-            temp.close()
             if not self.is_successful_merged:
                 try:
                     shutil.copy2(self.video_temp_file.name, self.video_out_path)

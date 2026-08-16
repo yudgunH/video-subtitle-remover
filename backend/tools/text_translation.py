@@ -15,7 +15,7 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-from backend.config import BASE_DIR
+from backend.tools.app_paths import get_data_path
 
 
 def _normalize_text(text):
@@ -158,7 +158,9 @@ class NineRouterTranslator:
         self.target_language = (target_language or "Vietnamese").strip()
         self.timeout = timeout
         self.session = requests.Session()
-        self._cache_path = os.path.join(BASE_DIR, "config", "translation_cache.json")
+        self._cache_path = str(
+            get_data_path("cache", "translation_cache.json", create_parent=True)
+        )
         self._cache_lock = threading.Lock()
         self._cache = self._load_cache()
 

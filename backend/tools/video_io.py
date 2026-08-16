@@ -58,7 +58,14 @@ class FFmpegVideoWriter:
     接口兼容 cv2.VideoWriter（write/release）。
     """
 
-    def __init__(self, output_path, fps, size):
+    def __init__(
+        self,
+        output_path,
+        fps,
+        size,
+        source_timestamps=None,
+        source_duration=None,
+    ):
         w, h = size
         ffmpeg_cli = FFmpegCLI.instance()
         use_nvenc = (
@@ -71,6 +78,14 @@ class FFmpegVideoWriter:
             else ['-c:v', 'libx264', '-crf', '18', '-preset', 'fast']
         )
         self.encoder_name = 'h264_nvenc' if use_nvenc else 'libx264'
+        self.fps = float(fps)
+        self.source_timestamps = tuple(source_timestamps or ())
+        self.source_duration = (
+            float(source_duration) if source_duration is not None else None
+        )
+        self._source_frames_received = 0
+        self._encoded_frames_written = 0
+        self._last_frame = None
         print(f"FFmpeg video encoder: {self.encoder_name}")
         cmd = [
             ffmpeg_cli.ffmpeg_path,
@@ -93,17 +108,43 @@ class FFmpegVideoWriter:
             stderr=subprocess.DEVNULL,
         )
 
-    def write(self, frame):
-        """写入一帧（numpy BGR 数组）。"""
+    def _write_encoded_frame(self, frame):
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
         try:
             self._process.stdin.write(frame.tobytes())
         except BrokenPipeError:
             pass
+        self._encoded_frames_written += 1
+
+    def write(self, frame):
+        """写入处理帧，并用重复帧保留源视频的 VFR 时间戳间隔。"""
+        timestamp = None
+        if self._source_frames_received < len(self.source_timestamps):
+            timestamp = self.source_timestamps[self._source_frames_received]
+        self._source_frames_received += 1
+
+        if timestamp is not None:
+            target_index = max(
+                self._encoded_frames_written,
+                int(round(timestamp * self.fps)),
+            )
+            if self._last_frame is not None:
+                while self._encoded_frames_written < target_index:
+                    self._write_encoded_frame(self._last_frame)
+
+        self._write_encoded_frame(frame)
+        self._last_frame = frame.copy()
 
     def release(self):
         """关闭管道并等待编码完成。"""
+        if self._last_frame is not None and self.source_duration is not None:
+            expected_frames = max(
+                self._encoded_frames_written,
+                int(round(self.source_duration * self.fps)),
+            )
+            while self._encoded_frames_written < expected_frames:
+                self._write_encoded_frame(self._last_frame)
         try:
             self._process.stdin.close()
         except BrokenPipeError:

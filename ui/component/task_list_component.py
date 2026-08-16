@@ -12,6 +12,7 @@ from showinfm import show_in_file_manager
 
 from backend.config import config, tr
 from backend.tools.common_tools import is_image_file
+from backend.tools.app_paths import get_data_directory
 
 @unique
 class TaskStatus(Enum):
@@ -43,7 +44,11 @@ class Task:
         """获取输出路径"""
         if self._output_path is not None:
             return self._output_path
-        save_directory = os.path.dirname(self.path) if not config.saveDirectory.value else config.saveDirectory.value
+        save_directory = (
+            config.saveDirectory.value
+            if config.saveDirectory.value
+            else str(get_data_directory("output"))
+        )
         if self.is_image:
             output_path = os.path.abspath(os.path.join(save_directory, f'{Path(self.path).stem}_no_sub.png'))
         else:

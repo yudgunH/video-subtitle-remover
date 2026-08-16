@@ -151,6 +151,7 @@ class SubtitleDetect:
             TextRecognition,
             self.paddle_device,
             model_name=model_config.REC_MODEL_NAME,
+            model_dir=model_config.REC_MODEL_DIR,
             enable_hpi=enable_hpi,
         )
         print(f"PaddleOCR Chinese recognition device: {actual_device}")

@@ -378,3 +378,8 @@ inference.onnx
 /config/config.json
 /.codex-preview/
 /backend/config/translation_cache.json
+/data/
+/.vsr-data-location.json
+/artifacts/
+/build/
+/dist/

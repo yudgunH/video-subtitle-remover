@@ -9,6 +9,13 @@
 import sys
 import os
 import configparser
+
+# This must run before importing OpenCV/Paddle/Torch/Qt so their caches and
+# temporary files are created in the user-selected portable data directory.
+from backend.tools.app_paths import initialize_runtime_environment, resource_root
+
+initialize_runtime_environment()
+
 import cv2
 import multiprocessing
 from PySide6.QtCore import Qt, QTranslator
@@ -28,6 +35,60 @@ from ui.advanced_setting_interface import AdvancedSettingInterface
 from ui.home_interface import HomeInterface
 
 
+def run_package_self_test():
+    """Load bundled OCR models and verify packaged runtime dependencies."""
+
+    import json
+    import subprocess
+    import traceback
+
+    from backend.tools.app_paths import get_data_path
+    from backend.tools.ffmpeg_cli import FFmpegCLI
+    from backend.tools.model_config import ModelConfig
+
+    report_path = get_data_path("package_self_test.json", create_parent=True)
+    report = {"success": False, "version": VERSION}
+    try:
+        from paddleocr import TextDetection, TextRecognition
+
+        model_config = ModelConfig()
+        detector = TextDetection(
+            model_name=model_config.DET_MODEL_NAME,
+            model_dir=model_config.DET_MODEL_DIR,
+            device="cpu",
+            enable_hpi=False,
+        )
+        recognizer = TextRecognition(
+            model_name=model_config.REC_MODEL_NAME,
+            model_dir=model_config.REC_MODEL_DIR,
+            device="cpu",
+            enable_hpi=False,
+        )
+        ffmpeg_result = subprocess.run(
+            [FFmpegCLI.instance().ffmpeg_path, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if ffmpeg_result.returncode != 0:
+            raise RuntimeError("Bundled FFmpeg failed its version check")
+        report.update(
+            success=True,
+            detection_model=model_config.DET_MODEL_NAME,
+            recognition_model=model_config.REC_MODEL_NAME,
+            ffmpeg=ffmpeg_result.stdout.splitlines()[0],
+        )
+        del detector, recognizer
+    except Exception as error:
+        report.update(error=str(error), traceback=traceback.format_exc())
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return 0 if report["success"] else 1
+
+
 class SubtitleExtractorGUI(FluentWindow): 
     def __init__(self):
         super().__init__()
@@ -42,7 +103,7 @@ class SubtitleExtractorGUI(FluentWindow):
         # self.themeListener.start()
  
         # 设置窗口图标
-        self.setWindowIcon(QtGui.QIcon("design/vsr.ico"))
+        self.setWindowIcon(QtGui.QIcon(str(resource_root() / "design" / "vsr.ico")))
         self.setWindowTitle(tr['SubtitleExtractorGUI']['Title'] + " v" + VERSION)
         # 创建界面布局
         self._create_layout()
@@ -178,6 +239,8 @@ class SubtitleExtractorGUI(FluentWindow):
 
 
 if __name__ == '__main__':
+    if "--package-self-test" in sys.argv:
+        raise SystemExit(run_package_self_test())
     multiprocessing.set_start_method("spawn")
     QApplication.setHighDpiScaleFactorRoundingPolicy(
     Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)

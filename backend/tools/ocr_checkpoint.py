@@ -11,6 +11,8 @@ from pathlib import Path
 import sqlite3
 import time
 
+from backend.tools.app_paths import get_data_directory
+
 
 SCHEMA_VERSION = 1
 
@@ -24,13 +26,7 @@ class OcrCheckpointState:
 
 
 def default_checkpoint_directory() -> Path:
-    if os.name == "nt" and os.getenv("LOCALAPPDATA"):
-        root = Path(os.environ["LOCALAPPDATA"])
-    elif os.getenv("XDG_CACHE_HOME"):
-        root = Path(os.environ["XDG_CACHE_HOME"])
-    else:
-        root = Path.home() / ".cache"
-    return root / "VideoSubtitleRemover" / "ocr_checkpoints"
+    return get_data_directory("ocr_checkpoints")
 
 
 class OcrCheckpointStore:

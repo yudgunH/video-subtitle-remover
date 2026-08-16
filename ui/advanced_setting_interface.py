@@ -2,6 +2,8 @@
 @desc: 高级设置页面
 """
 
+from pathlib import Path
+
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtWidgets import QFileDialog
 from qfluentwidgets import (ScrollArea, ExpandLayout, CardWidget, SubtitleLabel,
@@ -17,6 +19,7 @@ from backend.tools.secret_store import (
 from backend.tools.text_translation import NineRouterTranslator
 from backend.tools.version_service import VersionService
 from backend.tools.concurrent import TaskExecutor
+from backend.tools.app_paths import get_data_root, set_data_root
 
 class AdvancedSettingInterface(ScrollArea):
     """高级设置页面"""
@@ -70,6 +73,7 @@ class AdvancedSettingInterface(ScrollArea):
         self.translation_group.addSettingCard(self.nine_router_test)
         self.expandLayout.addWidget(self.translation_group)
 
+        self.advanced_group.addSettingCard(self.app_data_directory)
         self.advanced_group.addSettingCard(self.save_directory)
         self.advanced_group.addSettingCard(self.check_update_on_startup)
         self.expandLayout.addWidget(self.advanced_group)
@@ -219,6 +223,15 @@ class AdvancedSettingInterface(ScrollArea):
             parent=self.translation_group,
         )
         self.nine_router_test.clicked.connect(self.test_nine_router_connection)
+
+        self.app_data_directory = PushSettingCard(
+            text=tr["Setting"]["ChooseDirectory"],
+            icon=FluentIcon.FOLDER,
+            title=tr["Setting"]["AppDataDirectory"],
+            content=str(get_data_root()),
+            parent=self.advanced_group,
+        )
+        self.app_data_directory.clicked.connect(self.choose_app_data_directory)
 
         # 视频保存路径
         self.save_directory = PushSettingCard(
@@ -408,3 +421,29 @@ class AdvancedSettingInterface(ScrollArea):
 
         config.set(config.saveDirectory, folder)
         self.save_directory.setContent(tr["Setting"]["SaveDirectoryDefault"] if not config.saveDirectory.value else config.saveDirectory.value)
+
+    def choose_app_data_directory(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            tr["Setting"]["ChooseDirectory"],
+            str(get_data_root()),
+        )
+        if not folder:
+            return
+        try:
+            candidate = Path(folder).expanduser().resolve()
+            new_output_directory = str(candidate / "output")
+            config.set(config.saveDirectory, new_output_directory)
+            selected = set_data_root(candidate, migrate=True)
+            (selected / "output").mkdir(parents=True, exist_ok=True)
+            self.app_data_directory.setContent(str(selected))
+            self.save_directory.setContent(new_output_directory)
+            self.show_message_box(
+                tr["Setting"]["AppDataDirectory"],
+                tr["Setting"]["AppDataDirectoryRestart"],
+            )
+        except OSError as error:
+            self.show_message_box(
+                tr["Setting"]["AppDataDirectory"],
+                str(error),
+            )
