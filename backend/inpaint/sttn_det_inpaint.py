@@ -12,7 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import (
+    create_feathered_mask_alpha,
+    get_inpaint_area_by_mask,
+)
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -35,12 +38,22 @@ class STTNDetInpaint:
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
 
-    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
+    def __call__(
+        self,
+        input_frames: List[np.ndarray],
+        input_mask: np.ndarray,
+        composite_mask: np.ndarray | None = None,
+    ):
         """
         :param input_frames: 原视频帧
         :param mask: 字幕区域mask
         """
         mask = input_mask[:, :, None]
+        output_mask = input_mask if composite_mask is None else composite_mask
+        output_alpha = None
+        if composite_mask is not None:
+            output_alpha = create_feathered_mask_alpha(output_mask)[:, :, None]
+        output_mask = output_mask[:, :, None]
         H_ori, W_ori = mask.shape[:2]
         H_ori = int(H_ori + 0.5)
         W_ori = int(W_ori + 0.5)
@@ -85,12 +98,27 @@ class STTNDetInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
+                    area_ymin, area_ymax = inpaint_area[k][0:2]
+                    area_height = area_ymax - area_ymin
+                    comp = cv2.resize(comps[k][j], (W_ori, area_height))  # 将补全帧缩放回原大小
                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comp
+                    # Only replace pixels explicitly covered by the OCR mask.
+                    # The old implementation overwrote the complete full-width
+                    # strip with a 432x240 model result, blurring unrelated
+                    # details and subtitles outside the detected text box.
+                    frame_area = frame[area_ymin:area_ymax, :, :]
+                    if output_alpha is None:
+                        mask_area = output_mask[area_ymin:area_ymax, :, :] > 0
+                        np.copyto(frame_area, comp, where=mask_area)
+                    else:
+                        alpha_area = output_alpha[area_ymin:area_ymax, :, :]
+                        blended = (
+                            comp.astype(np.float32) * alpha_area
+                            + frame_area.astype(np.float32) * (1.0 - alpha_area)
+                        )
+                        frame_area[:] = np.clip(
+                            np.rint(blended), 0, 255
+                        ).astype(np.uint8)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
@@ -138,7 +166,10 @@ class STTNDetInpaint:
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
-        with torch.no_grad():
+        # STTN detection mode stays in FP32. Some high-contrast text masks can
+        # produce non-finite decoder values under FP16, which is unacceptable
+        # in the conservative Chinese replacement path.
+        with torch.inference_mode():
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息

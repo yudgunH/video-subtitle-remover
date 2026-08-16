@@ -46,6 +46,280 @@ def create_mask(size, coords_list):
                           (x2, y2), (255, 255, 255), thickness=-1)
     return mask
 
+
+def create_text_box_mask(size, coords_list, padding=3):
+    """Create a compact rectangular mask for trusted caption detections."""
+    height, width = tuple(size)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    padding = max(0, int(padding))
+    for xmin, xmax, ymin, ymax in coords_list or []:
+        x1 = max(0, min(width, int(xmin) - padding))
+        x2 = max(0, min(width, int(xmax) + padding))
+        y1 = max(0, min(height, int(ymin) - padding))
+        y2 = max(0, min(height, int(ymax) + padding))
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, thickness=-1)
+    return mask
+
+
+def _caption_area_for_box(box, caption_areas, frame_shape):
+    height, width = frame_shape[:2]
+    xmin, xmax, ymin, ymax = box
+    center_x = (xmin + xmax) / 2.0
+    center_y = (ymin + ymax) / 2.0
+    for area_ymin, area_ymax, area_xmin, area_xmax in caption_areas or []:
+        if (
+            area_ymin <= center_y <= area_ymax
+            and area_xmin <= center_x <= area_xmax
+        ):
+            return (
+                max(0, int(area_xmin)), min(width, int(area_xmax)),
+                max(0, int(area_ymin)), min(height, int(area_ymax)),
+            )
+    return (0, width, 0, height)
+
+
+def _expand_caption_line_box(frame, box, caption_areas):
+    """Recover the full horizontal caption line around a partial OCR box."""
+    height, width = frame.shape[:2]
+    xmin, xmax, ymin, ymax = (int(value) for value in box)
+    xmin, xmax = max(0, xmin), min(width, xmax)
+    ymin, ymax = max(0, ymin), min(height, ymax)
+    if xmax <= xmin or ymax <= ymin:
+        return None
+
+    text_height = max(4, ymax - ymin)
+    area_xmin, area_xmax, area_ymin, area_ymax = _caption_area_for_box(
+        box, caption_areas, frame.shape
+    )
+    vertical_padding = max(3, int(round(text_height * 0.35)))
+    scan_ymin = max(area_ymin, ymin - vertical_padding)
+    scan_ymax = min(area_ymax, ymax + vertical_padding)
+    if scan_ymax <= scan_ymin or area_xmax <= area_xmin:
+        return None
+
+    roi = frame[scan_ymin:scan_ymax, area_xmin:area_xmax]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    saturation = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 1]
+    blur_size = max(7, min(31, text_height | 1))
+    background = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+    light_floor = max(140, int(np.percentile(gray, 68)))
+    text_pixels = (
+        (gray >= light_floor)
+        & ((gray.astype(np.int16) - background.astype(np.int16)) >= 8)
+        & (saturation <= 120)
+    )
+    minimum_column_pixels = max(2, int(round(roi.shape[0] * 0.10)))
+    active_columns = (
+        np.count_nonzero(text_pixels, axis=0) >= minimum_column_pixels
+    ).astype(np.uint8)
+
+    # Bridge spaces between letters/words, but do not blindly widen to the
+    # complete selected rectangle. This is what recovers the two clipped ends
+    # when OCR recognizes only the middle of a caption line.
+    bridge = max(5, min(31, int(round(text_height * 0.9))))
+    active_columns = cv2.morphologyEx(
+        active_columns[None, :],
+        cv2.MORPH_CLOSE,
+        np.ones((1, bridge), dtype=np.uint8),
+    )[0]
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        active_columns[None, :], connectivity=8
+    )
+    seed_xmin = max(0, xmin - area_xmin)
+    seed_xmax = min(roi.shape[1], xmax - area_xmin)
+    horizontal_slack = max(4, text_height)
+    best = None
+    for label in range(1, labels_count):
+        run_xmin = int(stats[label, cv2.CC_STAT_LEFT])
+        run_xmax = run_xmin + int(stats[label, cv2.CC_STAT_WIDTH])
+        if run_xmax < seed_xmin - horizontal_slack:
+            continue
+        if run_xmin > seed_xmax + horizontal_slack:
+            continue
+        overlap = max(0, min(run_xmax, seed_xmax) - max(run_xmin, seed_xmin))
+        distance = max(0, seed_xmin - run_xmax, run_xmin - seed_xmax)
+        score = (overlap, -distance, run_xmax - run_xmin)
+        if best is None or score > best[0]:
+            best = (score, run_xmin, run_xmax)
+
+    # OCR frequently returns only the middle word/fragment even though the
+    # detector polygon visually overlaps that fragment well. Always guarantee
+    # a wide horizontal safety margin; do not use it only as a fallback when
+    # visual projection fails. 3.5 character-heights covers roughly 3--4 Latin
+    # glyphs on either end, matching the common clipped-caption failure.
+    fallback = max(16, int(round(text_height * 3.5)))
+    if best is None:
+        line_xmin = max(area_xmin, xmin - fallback)
+        line_xmax = min(area_xmax, xmax + fallback)
+    else:
+        _, run_xmin, run_xmax = best
+        line_xmin = max(area_xmin, area_xmin + run_xmin - 3)
+        line_xmax = min(area_xmax, area_xmin + run_xmax + 3)
+        # Never let a plausible-looking middle run suppress the deterministic
+        # margin. That exact behavior left fragments on both caption edges.
+        line_xmin = min(line_xmin, max(area_xmin, xmin - fallback))
+        line_xmax = max(line_xmax, min(area_xmax, xmax + fallback))
+
+    return (
+        line_xmin, line_xmax,
+        max(area_ymin, ymin - vertical_padding),
+        min(area_ymax, ymax + vertical_padding),
+    )
+
+
+def create_caption_text_union_mask(
+    frame_coordinate_pairs, caption_areas, size=None
+):
+    """Mask complete caption lines even when OCR returns only a middle box."""
+    pairs = list(frame_coordinate_pairs or [])
+    if size is None:
+        if not pairs:
+            raise ValueError("size is required when no caption references exist")
+        size = pairs[0][0].shape[:2]
+    expanded_boxes = []
+    for frame, coordinates in pairs:
+        for coordinate in coordinates or []:
+            expanded = _expand_caption_line_box(
+                frame, coordinate, caption_areas
+            )
+            if expanded is not None and expanded not in expanded_boxes:
+                expanded_boxes.append(expanded)
+    return create_text_box_mask(size, expanded_boxes, padding=2)
+
+
+def _add_chinese_text_candidates(mask, frame, coords_list):
+    """Add conservative stroke candidates from one reference frame."""
+    height, width = frame.shape[:2]
+    for xmin, xmax, ymin, ymax in coords_list or []:
+        xmin = max(0, min(int(xmin), width))
+        xmax = max(0, min(int(xmax), width))
+        ymin = max(0, min(int(ymin), height))
+        ymax = max(0, min(int(ymax), height))
+        if xmax - xmin < 24 or ymax - ymin < 10:
+            continue
+
+        roi = frame[ymin:ymax, xmin:xmax]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        saturation = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 1]
+        kernel = max(7, ((max(3, (ymax - ymin) // 3) // 2) * 2) + 1)
+        local_background = cv2.GaussianBlur(gray, (kernel, kernel), 0)
+        gray_i16 = gray.astype(np.int16)
+        local_i16 = local_background.astype(np.int16)
+
+        bright_floor = max(155, int(np.percentile(gray, 72)))
+        neutral_color = saturation <= 85
+        bright_strokes = (
+            (gray >= bright_floor)
+            & ((gray_i16 - local_i16) >= 12)
+            & neutral_color
+        )
+        candidate = bright_strokes.astype(np.uint8) * 255
+        candidate = cv2.morphologyEx(
+            candidate, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8)
+        )
+        evidence_coverage = np.count_nonzero(candidate) / float(candidate.size)
+        columns = np.flatnonzero(np.any(candidate > 0, axis=0))
+        if evidence_coverage < 0.005 or evidence_coverage > 0.50 or len(columns) < 2:
+            continue
+        if columns[-1] - columns[0] < max(12, int(candidate.shape[1] * 0.25)):
+            continue
+        candidate = cv2.dilate(
+            candidate, np.ones((3, 3), np.uint8), iterations=4
+        )
+        # OCR boxes are commonly tight around individual glyph strokes. Join
+        # nearby strokes before temporal union so the reconstructed patch does
+        # not retain recognizable holes or broken pieces of the original text.
+        # This is still constrained to a confirmed Chinese OCR rectangle.
+        candidate = cv2.morphologyEx(
+            candidate,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 5)),
+        )
+        mask[ymin:ymax, xmin:xmax] = cv2.bitwise_or(
+            mask[ymin:ymax, xmin:xmax], candidate
+        )
+
+
+def create_chinese_text_union_mask(frame_coordinate_pairs, size=None):
+    """Build one mask from multiple temporal references without full-frame churn."""
+    pairs = list(frame_coordinate_pairs or [])
+    if size is None:
+        if not pairs:
+            raise ValueError("size is required when no Chinese mask references exist")
+        size = pairs[0][0].shape[:2]
+    mask = np.zeros(tuple(size), dtype=np.uint8)
+    for reference_frame, coords_list in pairs:
+        _add_chinese_text_candidates(mask, reference_frame, coords_list)
+
+    if np.any(mask):
+        # The OCR rectangle is tight and the first dilation above is clipped to
+        # it. This final three-pixel halo covers anti-aliased edges and shadows
+        # just outside the rectangle without replacing the entire box.
+        mask = cv2.dilate(
+            mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        )
+    return mask
+
+
+def create_chinese_text_mask(frame, coords_list):
+    """Build a conservative stroke-level mask around confirmed Chinese boxes.
+
+    Full rectangular OCR boxes can cover diagrams, logos, or small components
+    behind the text. This mask selects high-contrast, low-saturation light
+    strokes and deliberately skips ambiguous, dark, or colored regions.
+    Missing an unusual text color is safer than deleting real video content.
+    """
+    return create_chinese_text_union_mask([(frame, coords_list)])
+
+
+def create_feathered_mask_alpha(mask, radius=None):
+    """Return a hard-core mask with a short, soft outer transition.
+
+    Confirmed text pixels remain fully replaced (alpha 1). Only a small halo
+    outside the binary mask is blended, avoiding a glyph-shaped hard seam while
+    keeping unrelated frame detail bit-identical farther away.
+    """
+    if mask.ndim != 2:
+        raise ValueError("feather mask must be a 2-D array")
+    height, width = mask.shape
+    if radius is None:
+        radius = max(1, min(4, int(round(min(height, width) / 360.0))))
+    radius = max(0, int(radius))
+    hard = (mask > 0).astype(np.float32)
+    if radius == 0 or not np.any(hard):
+        return hard
+
+    # Give the replacement one solid pixel outside the detected edge, then
+    # fade it into the source over a few pixels. np.maximum preserves alpha=1
+    # over the complete original mask.
+    solid_halo = cv2.dilate(
+        hard,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    kernel_size = radius * 2 + 1
+    feather = cv2.GaussianBlur(
+        solid_halo, (kernel_size, kernel_size), sigmaX=max(0.8, radius * 0.65)
+    )
+    return np.maximum(hard, np.clip(feather, 0.0, 1.0))
+
+
+def composite_with_feather(original, generated, mask, radius=None):
+    """Blend an inpainted image through a feathered Chinese-text mask."""
+    if original.shape != generated.shape or original.shape[:2] != mask.shape:
+        raise ValueError("original, generated, and mask dimensions must match")
+    alpha = create_feathered_mask_alpha(mask, radius=radius)[:, :, None]
+    if not np.any(alpha):
+        return original.copy()
+    blended = (
+        generated.astype(np.float32) * alpha
+        + original.astype(np.float32) * (1.0 - alpha)
+    )
+    return np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
     """
     获取字幕去除区域，根据mask来确定需要填补的区域和高度，

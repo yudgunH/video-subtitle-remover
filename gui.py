@@ -46,6 +46,11 @@ class SubtitleExtractorGUI(FluentWindow):
         self.setWindowTitle(tr['SubtitleExtractorGUI']['Title'] + " v" + VERSION)
         # 创建界面布局
         self._create_layout()
+        available = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.setMinimumSize(
+            min(900, max(1, available.width() - 24)),
+            min(620, max(1, available.height() - 24)),
+        )
         self._connectSignalToSlot()
         self._lazy_check_update()
 
@@ -120,25 +125,32 @@ class SubtitleExtractorGUI(FluentWindow):
                 print(f"更新进度时出错: {str(e)}")
 
     def load_window_position(self):
-        # 尝试读取窗口位置
+        """Restore a window geometry that always fits the usable desktop."""
         try:
             x = config.windowX.value
             y = config.windowY.value
-            width = config.windowW.value
-            height = config.windowH.value
+            screen = QtWidgets.QApplication.screenAt(QtGui.QCursor.pos())
+            if screen is None:
+                screen = QtWidgets.QApplication.primaryScreen()
+            screen_rect = screen.availableGeometry()
 
-            if not x or not y:
-                self.center_window()
-                return
+            # Leave a small safety margin for the frame/shadow. Old versions
+            # saved 1200 px high windows, which could extend below the taskbar.
+            max_width = max(1, screen_rect.width() - 24)
+            max_height = max(1, screen_rect.height() - 24)
+            min_width = min(900, max_width)
+            min_height = min(620, max_height)
+            width = max(min_width, min(int(config.windowW.value or 1280), max_width))
+            height = max(min_height, min(int(config.windowH.value or 820), max_height))
 
-            # 确保窗口在屏幕内
-            screen_rect = QtWidgets.QApplication.primaryScreen().availableGeometry()
-            if (x >= 0 and y >= 0 and 
-                x + width <= screen_rect.width() and 
-                y + height <= screen_rect.height()):
-                self.setGeometry(x, y, width, height)
+            if x is None or y is None:
+                x = screen_rect.left() + (screen_rect.width() - width) // 2
+                y = screen_rect.top() + (screen_rect.height() - height) // 2
             else:
-                self.center_window()
+                x = max(screen_rect.left(), min(int(x), screen_rect.right() - width + 1))
+                y = max(screen_rect.top(), min(int(y), screen_rect.bottom() - height + 1))
+
+            self.setGeometry(x, y, width, height)
         except Exception as e:
             print(e)
             self.center_window()
@@ -146,6 +158,10 @@ class SubtitleExtractorGUI(FluentWindow):
     def center_window(self):
         """将窗口居中显示"""
         screen_rect = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.resize(
+            min(max(self.width(), 900), max(1, screen_rect.width() - 24)),
+            min(max(self.height(), 620), max(1, screen_rect.height() - 24)),
+        )
         window_rect = self.frameGeometry()
         center_point = screen_rect.center()
         window_rect.moveCenter(center_point)

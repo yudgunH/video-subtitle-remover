@@ -4,11 +4,12 @@ import threading
 import multiprocessing
 import time
 import traceback
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
-from PySide6.QtCore import Slot, QRect, Signal
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QLabel
+from PySide6.QtCore import Slot, QRect, Signal, Qt
 from PySide6 import QtWidgets
 from datetime import datetime
-from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon)
+from qfluentwidgets import (PushButton, PrimaryPushButton, CardWidget, TextEdit,
+                           FluentIcon, SubtitleLabel, BodyLabel)
 from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
@@ -18,6 +19,30 @@ from backend.tools.constant import InpaintMode
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, read_image
+from backend.tools.secret_store import get_nine_router_api_key
+
+
+def _parse_normalized_areas(value):
+    areas = []
+    for raw_area in str(value or "").split(";"):
+        try:
+            ymin, ymax, xmin, xmax = map(float, raw_area.split(","))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= ymin < ymax <= 1 and 0 <= xmin < xmax <= 1:
+            areas.append((ymin, ymax, xmin, xmax))
+    return areas
+
+
+def _is_full_frame_selection(areas, tolerance=0.02):
+    if len(areas or []) != 1:
+        return False
+    ymin, ymax, xmin, xmax = areas[0]
+    return (
+        ymin <= tolerance and xmin <= tolerance
+        and ymax >= 1 - tolerance and xmax >= 1 - tolerance
+    )
+
 
 class HomeInterface(QWidget):
     progress_signal = Signal(int, bool)
@@ -67,19 +92,49 @@ class HomeInterface(QWidget):
 
     def __init_widgets(self):
         """创建主页面"""
-        main_layout = QHBoxLayout(self)
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout = QVBoxLayout(self)
+        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+
+        # 顶部信息区：让用户一眼看懂当前工具的核心能力
+        hero_card = CardWidget(self)
+        hero_layout = QHBoxLayout(hero_card)
+        hero_layout.setContentsMargins(20, 14, 20, 14)
+        hero_layout.setSpacing(16)
+        hero_text_layout = QVBoxLayout()
+        hero_text_layout.setSpacing(3)
+        hero_title = SubtitleLabel(tr['SubtitleExtractorGUI']['Title'], hero_card)
+        hero_description = BodyLabel(tr['SubtitleExtractorGUI']['HeroDescription'], hero_card)
+        hero_description.setWordWrap(True)
+        hero_text_layout.addWidget(hero_title)
+        hero_text_layout.addWidget(hero_description)
+        hero_layout.addLayout(hero_text_layout, 1)
+
+        capability_badge = QLabel("OCR  •  CHINESE  •  AI INPAINT", hero_card)
+        capability_badge.setAlignment(Qt.AlignCenter)
+        capability_badge.setStyleSheet(
+            "QLabel { background-color: #1677ff; color: white; border-radius: 11px; "
+            "padding: 6px 12px; font-size: 11px; font-weight: 600; }"
+        )
+        hero_layout.addWidget(capability_badge, 0, Qt.AlignVCenter)
+        root_layout.addWidget(hero_card)
+
+        workspace_splitter = QSplitter(Qt.Horizontal, self)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.setHandleWidth(4)
 
         # 左侧视频区域
-        left_layout = QVBoxLayout()
+        left_panel = QWidget(workspace_splitter)
+        left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(8)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.addWidget(SubtitleLabel(tr['SubtitleExtractorGUI']['PreviewWorkspace'], left_panel))
         
         # 创建视频显示组件
         self.video_display_component = VideoDisplayComponent(self)
         self.video_display_component.ab_sections_changed.connect(self.ab_sections_changed)
         self.video_display_component.selections_changed.connect(self.selections_changed)
-        left_layout.addWidget(self.video_display_component)
+        left_layout.addWidget(self.video_display_component, 1)
         
         # 获取视频显示和滑块的引用
         self.video_display = self.video_display_component.video_display
@@ -88,7 +143,9 @@ class HomeInterface(QWidget):
         
         # 输出文本区域
         self.output_text = TextEdit()
-        self.output_text.setMinimumHeight(150)
+        left_layout.addWidget(SubtitleLabel(tr['SubtitleExtractorGUI']['ActivityLog'], left_panel))
+        self.output_text.setMinimumHeight(80)
+        self.output_text.setMaximumHeight(140)
         self.output_text.setReadOnly(True)
         self.output_text.document().setDocumentMargin(10)        
         # 连接滚动条值变化信号
@@ -100,12 +157,15 @@ class HomeInterface(QWidget):
         output_layout.addWidget(self.output_text)
         output_container.setLayout(output_layout)
         left_layout.addWidget(output_container)
-
-        main_layout.addLayout(left_layout, 2)
+        workspace_splitter.addWidget(left_panel)
 
         # 右侧设置区域
-        right_layout = QVBoxLayout()
+        right_panel = QWidget(workspace_splitter)
+        right_panel.setMinimumWidth(340)
+        right_layout = QVBoxLayout(right_panel)
         right_layout.setSpacing(10)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.addWidget(SubtitleLabel(tr['SubtitleExtractorGUI']['ControlPanel'], right_panel))
 
         # 设置容器
         settings_container = CardWidget(self)
@@ -113,35 +173,27 @@ class HomeInterface(QWidget):
         settings_container.setLayout(self.setting_interface)
         right_layout.addWidget(settings_container)
         
-        # 添加任务列表容器
-        task_list_container = CardWidget(self)
-        task_list_layout = QHBoxLayout()
-        task_list_layout.setContentsMargins(0, 0, 0, 0)
-        task_list_layout.setSpacing(0)
-        self.task_list_component = TaskListComponent(self)
-        self.task_list_component.task_selected.connect(self.on_task_selected)
-        self.task_list_component.task_deleted.connect(self.on_task_deleted)
-        task_list_layout.addWidget(self.task_list_component)
-        task_list_container.setLayout(task_list_layout)
-        right_layout.addWidget(task_list_container, 1)  # 占满剩余空间
-        
         # 操作按钮容器
         button_container = CardWidget(self)
+        button_container.setObjectName("actionBar")
         button_layout = QHBoxLayout()
-        button_layout.setContentsMargins(16, 16, 16, 16)
+        button_layout.setContentsMargins(12, 12, 12, 12)
         button_layout.setSpacing(8)
         
         self.file_button = PushButton(tr['SubtitleExtractorGUI']['Open'], self)
+        self.file_button.setMinimumHeight(36)
         self.file_button.setIcon(FluentIcon.FOLDER)
         self.file_button.clicked.connect(self.open_file)
         button_layout.addWidget(self.file_button)
         
-        self.run_button = PushButton(tr['SubtitleExtractorGUI']['Run'], self)
+        self.run_button = PrimaryPushButton(tr['SubtitleExtractorGUI']['Run'], self)
+        self.run_button.setMinimumHeight(36)
         self.run_button.setIcon(FluentIcon.PLAY)
         self.run_button.clicked.connect(self.run_button_clicked)
         button_layout.addWidget(self.run_button)
         
         self.stop_button = PushButton(tr['SubtitleExtractorGUI']['Stop'], self)
+        self.stop_button.setMinimumHeight(36)
         self.stop_button.setIcon(MyFluentIcon.Stop)
         self.stop_button.setVisible(False)
         self.stop_button.clicked.connect(self.stop_button_clicked)
@@ -151,7 +203,31 @@ class HomeInterface(QWidget):
         button_container.setLayout(button_layout)
         right_layout.addWidget(button_container)
 
-        main_layout.addLayout(right_layout, 1)
+        # Keep the primary actions above the queue. The queue can shrink and
+        # scroll, while Open/Run/Stop must remain reachable at all times.
+        right_layout.addWidget(SubtitleLabel(tr['SubtitleExtractorGUI']['TaskQueue'], right_panel))
+        task_list_container = CardWidget(self)
+        task_list_layout = QHBoxLayout()
+        task_list_layout.setContentsMargins(0, 0, 0, 0)
+        task_list_layout.setSpacing(0)
+        self.task_list_component = TaskListComponent(self)
+        self.task_list_component.task_selected.connect(self.on_task_selected)
+        self.task_list_component.task_deleted.connect(self.on_task_deleted)
+        self.setting_interface.translate_non_subtitle_cjk.checkedChanged.connect(
+            self._on_translation_mode_changed
+        )
+        self.setting_interface.remove_cjk_text.checkedChanged.connect(
+            self._on_remove_cjk_mode_changed
+        )
+        task_list_layout.addWidget(self.task_list_component)
+        task_list_container.setLayout(task_list_layout)
+        right_layout.addWidget(task_list_container, 1)
+
+        workspace_splitter.addWidget(right_panel)
+        workspace_splitter.setStretchFactor(0, 2)
+        workspace_splitter.setStretchFactor(1, 1)
+        workspace_splitter.setSizes([780, 420])
+        root_layout.addWidget(workspace_splitter, 1)
     
     def on_scroll_change(self, value):
         """监控滚动条位置变化"""
@@ -188,6 +264,85 @@ class HomeInterface(QWidget):
         if get_current_task_index == -1:
             return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
+        if config.translateNonSubtitleCjk.value or config.removeCjkText.value:
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.TRANSLATION_EXCLUDE_AREAS,
+                selections,
+            )
+            serialized = ";".join(
+                ",".join(str(round(value, 4)) for value in area)
+                for area in selections
+            )
+            if serialized:
+                config.set(config.translationSubtitleExclusionAreas, serialized)
+
+    def _translation_exclusion_areas(self, index):
+        candidates = [
+            self.task_list_component.get_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, []
+            ),
+            self.task_list_component.get_task_option(
+                index, TaskOptions.SUB_AREAS, []
+            ),
+            _parse_normalized_areas(config.translationSubtitleExclusionAreas.value),
+            _parse_normalized_areas(
+                config.translationSubtitleExclusionAreas.defaultValue
+            ),
+        ]
+        for areas in candidates:
+            if areas and not _is_full_frame_selection(areas):
+                return list(areas)
+        return [(0.82, 0.99, 0.05, 0.95)]
+
+    def _restore_normal_selection(self, index):
+        selections = self.task_list_component.get_task_option(
+            index, TaskOptions.SUB_AREAS, []
+        )
+        if not selections or _is_full_frame_selection(selections):
+            selections = _parse_normalized_areas(config.subtitleSelectionAreas.value)
+        if not selections or _is_full_frame_selection(selections):
+            selections = _parse_normalized_areas(
+                config.subtitleSelectionAreas.defaultValue
+            )
+        self.video_display_component.set_selection_rects(selections)
+        self.task_list_component.update_task_option(
+            index, TaskOptions.SUB_AREAS, selections
+        )
+
+    def _on_translation_mode_changed(self, enabled):
+        index = self.task_list_component.get_current_task_index()
+        if index < 0:
+            return
+        if enabled:
+            exclusion_areas = self._translation_exclusion_areas(index)
+            self.video_display_component.set_selection_rects(exclusion_areas)
+            self.task_list_component.update_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, exclusion_areas
+            )
+        elif config.removeCjkText.value:
+            caption_areas = self._translation_exclusion_areas(index)
+            self.video_display_component.set_selection_rects(caption_areas)
+            self.task_list_component.update_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, caption_areas
+            )
+        else:
+            self._restore_normal_selection(index)
+
+    def _on_remove_cjk_mode_changed(self, enabled):
+        if config.translateNonSubtitleCjk.value:
+            return
+        index = self.task_list_component.get_current_task_index()
+        if index < 0:
+            return
+        if enabled:
+            caption_areas = self._translation_exclusion_areas(index)
+            self.video_display_component.set_selection_rects(caption_areas)
+            self.task_list_component.update_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, caption_areas
+            )
+        else:
+            self._restore_normal_selection(index)
 
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
@@ -201,7 +356,19 @@ class HomeInterface(QWidget):
         ab_sections = self.task_list_component.get_task_option(index, TaskOptions.AB_SECTIONS, [])
         self.video_display_component.set_ab_sections(ab_sections)
         selections = self.task_list_component.get_task_option(index, TaskOptions.SUB_AREAS, [])
-        if len(selections) <= 0:
+        if config.translateNonSubtitleCjk.value:
+            exclusion_areas = self._translation_exclusion_areas(index)
+            self.video_display_component.set_selection_rects(exclusion_areas)
+            self.task_list_component.update_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, exclusion_areas
+            )
+        elif config.removeCjkText.value:
+            caption_areas = self._translation_exclusion_areas(index)
+            self.video_display_component.set_selection_rects(caption_areas)
+            self.task_list_component.update_task_option(
+                index, TaskOptions.TRANSLATION_EXCLUDE_AREAS, caption_areas
+            )
+        elif len(selections) <= 0:
             self.video_display_component.load_selections_from_config()
         else:
             self.video_display_component.set_selection_rects(selections)
@@ -310,13 +477,35 @@ class HomeInterface(QWidget):
         self.stop_button.setVisible(not show_run)
 
     def run_button_clicked(self):
-        if not self.task_list_component.get_pending_tasks():
+        pending_tasks = self.task_list_component.get_pending_tasks()
+
+        # Recover gracefully if a video was previewed but an older UI/logging
+        # error prevented it from being inserted into the task queue.
+        if (
+            not pending_tasks
+            and not self.task_list_component.get_all_tasks()
+            and self.video_path
+            and os.path.isfile(self.video_path)
+        ):
+            self.task_list_component.add_task(self.video_path)
+            index = self.task_list_component.find_task_index_by_path(self.video_path)
+            if index >= 0:
+                self.task_list_component.select_task(index)
+            pending_tasks = self.task_list_component.get_pending_tasks()
+
+        if not pending_tasks:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
 
+        translation_api_key = ""
+        if config.translateNonSubtitleCjk.value:
+            translation_api_key = get_nine_router_api_key()
+            if not translation_api_key:
+                self.append_output(tr['Main']['TranslationApiKeyMissing'])
+                return
+
         try:
             # 获取所有待执行的任务
-            pending_tasks = self.task_list_component.get_pending_tasks()
             if not pending_tasks:
                 return
 
@@ -338,12 +527,6 @@ class HomeInterface(QWidget):
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
                                 continue
 
-                            # 获取字幕区域坐标，未选择则使用全屏
-                            subtitle_areas = self.task_list_component.get_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, [])
-                            if not subtitle_areas or len(subtitle_areas) <= 0:
-                                subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
-                                self.task_list_component.update_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, subtitle_areas)
-
                             self.video_display_component.save_selections_to_config()
 
                             # 更新任务状态为运行中
@@ -359,11 +542,54 @@ class HomeInterface(QWidget):
 
                             self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.PROCESSING)
                             options = {}
+                            full_frame_area = [(0, self.frame_height, 0, self.frame_width)]
+                            if (
+                                config.translateNonSubtitleCjk.value
+                                or config.removeCjkText.value
+                            ):
+                                saved_subtitle_areas = self._translation_exclusion_areas(
+                                    self.current_processing_task_index
+                                )
+                            else:
+                                saved_subtitle_areas = self.task_list_component.get_task_option(
+                                    self.current_processing_task_index,
+                                    TaskOptions.SUB_AREAS,
+                                    [],
+                                )
+                            exclusion_areas = (
+                                self.video_display_component.preview_coordinates_to_video_coordinates(
+                                    saved_subtitle_areas
+                                )
+                                if saved_subtitle_areas
+                                else []
+                            )
                             for key in task_item.options:
                                 value = task_item.options[key]
                                 if key == TaskOptions.SUB_AREAS.value:
-                                    value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
+                                    if value:
+                                        value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
+                                    else:
+                                        value = full_frame_area
                                 options[key] = value
+                            # CJK processing scans the full frame internally,
+                            # while this selection remains the trusted caption
+                            # zone for removing every detected language.
+                            if (
+                                config.translateNonSubtitleCjk.value
+                                or config.removeCjkText.value
+                            ):
+                                options[TaskOptions.SUB_AREAS.value] = exclusion_areas
+                            else:
+                                options.setdefault(
+                                    TaskOptions.SUB_AREAS.value, full_frame_area
+                                )
+                            if (
+                                config.translateNonSubtitleCjk.value
+                                or config.removeCjkText.value
+                            ):
+                                options[TaskOptions.TRANSLATION_EXCLUDE_AREAS.value] = exclusion_areas
+                            if config.translateNonSubtitleCjk.value:
+                                options[TaskOptions.TRANSLATION_API_KEY.value] = translation_api_key
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -532,7 +758,13 @@ class HomeInterface(QWidget):
             color = '#2980b9'
         html = f'<span style="color:#888;">[{timestamp}]</span> <span style="color:{color};">{escaped}</span><br>'
         self.output_text.append(html)
-        print(*args)  # 保持原始的 print 行为
+        # Console output is optional for the GUI. On Windows, ``python.exe``
+        # can expose a cp1252 stream which cannot encode CJK file names; that
+        # must never abort the Open -> Add task flow.
+        try:
+            print(*args)
+        except (UnicodeEncodeError, OSError, AttributeError):
+            pass
         # 如果启用了自动滚动，则滚动到底部
         if self.auto_scroll:
             scrollbar = self.output_text.verticalScrollBar()
@@ -646,8 +878,8 @@ class HomeInterface(QWidget):
             # 倒序打开, 确保第一个视频截图显示在屏幕上
             for path in reversed(files):
                 if self.load_video(path):
-                    self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoSuccess']}: {path}")
                     files_loaded.append(path)
+                    self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoSuccess']}: {path}")
                 else:
                     self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoFailed']}: {path}")
             # 正序添加, 确保任务列表顺序一致
@@ -685,4 +917,3 @@ class HomeInterface(QWidget):
         except Exception as e:
             print(f"Error during close window:", e)
         super().closeEvent(event)
-    

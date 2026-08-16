@@ -1,5 +1,6 @@
 import os
 import stat
+import subprocess
 
 import platform
 from .common_tools import merge_big_file_if_not_exists
@@ -21,7 +22,35 @@ class FFmpegCLI:
         return cls._instance
     
     def __init__(self):
+        self._nvenc_supported = None
         os.chmod(self.ffmpeg_path, stat.S_IRWXU + stat.S_IRWXG + stat.S_IRWXO)
+
+    def supports_h264_nvenc(self):
+        """Run a one-frame encoder smoke test and cache the result."""
+        if self._nvenc_supported is not None:
+            return self._nvenc_supported
+
+        command = [
+            self.ffmpeg_path,
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', '256x256', '-r', '1',
+            '-i', '-', '-frames:v', '1',
+            '-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '18', '-b:v', '0',
+            '-f', 'null', '-'
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                input=bytes(256 * 256 * 3),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+            self._nvenc_supported = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            self._nvenc_supported = False
+        return self._nvenc_supported
         
     @property
     def ffmpeg_path(self):

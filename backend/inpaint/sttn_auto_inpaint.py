@@ -16,6 +16,7 @@ from backend.config import config
 from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
+from backend.tools.torch_inference import cuda_autocast
 from backend.tools.video_io import FramePrefetcher
 from backend.tools.hardware_accelerator import HardwareAccelerator
 
@@ -131,7 +132,7 @@ class STTNInpaint:
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
-        with torch.no_grad():
+        with torch.inference_mode(), cuda_autocast(self.device):
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder(feats.view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息
@@ -242,7 +243,7 @@ class STTNAutoInpaint:
             for i in range(rec_time):
                 start_f = i * effective_clip_gap  # 起始帧位置
                 end_f = min((i + 1) * effective_clip_gap, frame_info['len'])  # 结束帧位置
-                tqdm.write(f'Processing: {start_f + 1} - {end_f} / Total: {frame_info['len']}')
+                tqdm.write(f"Processing: {start_f + 1} - {end_f} / Total: {frame_info['len']}")
                 
                 frames_hr = []  # 高分辨率帧列表
                 frames = {}  # 帧字典，用于存储裁剪后的图像

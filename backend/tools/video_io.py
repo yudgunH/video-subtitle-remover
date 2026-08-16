@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from .ffmpeg_cli import FFmpegCLI
+from .hardware_accelerator import HardwareAccelerator
 
 
 class FramePrefetcher:
@@ -53,14 +54,26 @@ class FramePrefetcher:
 
 class FFmpegVideoWriter:
     """
-    通过 FFmpeg 管道写入帧，使用 libx264 编码。
+    通过 FFmpeg 管道写入帧；CUDA可用时优先NVENC，否则使用libx264。
     接口兼容 cv2.VideoWriter（write/release）。
     """
 
     def __init__(self, output_path, fps, size):
         w, h = size
+        ffmpeg_cli = FFmpegCLI.instance()
+        use_nvenc = (
+            HardwareAccelerator.instance().has_cuda()
+            and ffmpeg_cli.supports_h264_nvenc()
+        )
+        encoder_args = (
+            ['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '18', '-b:v', '0']
+            if use_nvenc
+            else ['-c:v', 'libx264', '-crf', '18', '-preset', 'fast']
+        )
+        self.encoder_name = 'h264_nvenc' if use_nvenc else 'libx264'
+        print(f"FFmpeg video encoder: {self.encoder_name}")
         cmd = [
-            FFmpegCLI.instance().ffmpeg_path,
+            ffmpeg_cli.ffmpeg_path,
             '-y',
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
@@ -68,10 +81,8 @@ class FFmpegVideoWriter:
             '-pix_fmt', 'bgr24',
             '-r', str(fps),
             '-i', '-',
-            '-c:v', 'libx264',
+            *encoder_args,
             '-pix_fmt', 'yuv420p',
-            '-crf', '18',
-            '-preset', 'fast',
             '-loglevel', 'error',
             output_path
         ]

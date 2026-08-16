@@ -22,6 +22,8 @@ Video-subtitle-remover (VSR) 是一款基于AI技术，将视频中的硬字幕�
 - 提取原视频字幕，可配合：[video-subtitle-extractor (VSE)](https://github.com/YaoFANGUK/video-subtitle-extractor)
 - 支持自定义字幕位置，仅去除定义位置中的字幕（传入位置）
 - 支持全视频自动去除所有文本（不传入位置）
+- 删除所选字幕区域内检测到的全部文字；区域外仅保守删除已确认的中文，并支持通过 9Router 翻译后写回视频
+- 每 300 帧自动保存安全的 OCR 检查点；同一视频和设置重试时会从中断位置继续扫描
 - 支持多选图片批量去除水印文本
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)
@@ -80,6 +82,21 @@ options:
                         Subtitle area coordinates (ymin ymax xmin xmax). Can be specified multiple times for multiple areas.
   --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv}
                         Inpaint mode, default is sttn-auto
+  --remove-chinese-text 删除 -c 字幕区域内全部文字，区域外仅删除已确认的中文
+  --translate-non-subtitle-chinese
+                        使用 9Router 翻译 -c 指定字幕区域外已确认的中文
+  --translation-target-language {Vietnamese,English,Simplified Chinese,Japanese,Korean,Spanish}
+  --nine-router-base-url NINE_ROUTER_BASE_URL
+  --nine-router-model NINE_ROUTER_MODEL
+```
+
+**9Router 翻译（GUI）：** 在高级设置的 “9Router 翻译” 中填写 API 地址、模型和 API key，先点击测试；回到主页开启“翻译字幕外的中文”，选择目标语言，并用绿色框标记字幕区域。框内检测到的全部文字会被删除；框外仅删除并翻译已确认的中文。API key 保存在操作系统凭据库中，不写入 `config.json`。
+
+**9Router 翻译（CLI）：** 将 API key 放入环境变量 `VSR_9ROUTER_API_KEY`。例如：
+
+```powershell
+$env:VSR_9ROUTER_API_KEY="your-9router-key"
+python backend/main.py -i input.mp4 -o output.mp4 -c 580 720 0 1280 --translate-non-subtitle-chinese --translation-target-language Vietnamese --nine-router-base-url https://9router.hbfstudio.site/v1 --nine-router-model auto
 ```
 ## 演示
 
@@ -94,16 +111,16 @@ options:
 
 #### 1. 安装 Python
 
-请确保您已经安装了 Python 3.12+。
+请确保您已经安装了 Python 3.11 或 3.12。
 
 - Windows 用户可以前往 [Python 官网](https://www.python.org/downloads/windows/) 下载并安装 Python。
 - MacOS 用户可以使用 Homebrew 安装：
   ```shell
-  brew install python@3.12
+  brew install python@3.11
   ```
 - Linux 用户可以使用包管理器安装，例如 Ubuntu/Debian：
   ```shell
-  sudo apt update && sudo apt install python3.12 python3.12-venv python3.12-dev
+  sudo apt update && sudo apt install python3.11 python3.11-venv python3.11-dev
   ```
 
 #### 2. 安装依赖文件

@@ -1,11 +1,33 @@
 import cv2
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu
-from PySide6.QtCore import Qt, Signal, QRect, QRectF, QObject, QEvent
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu, QSizePolicy
+from PySide6.QtCore import Qt, Signal, QRect, QRectF, QSize, QEvent
 from PySide6.QtGui import QAction, QShortcut, QCursor
 from PySide6 import QtCore, QtWidgets, QtGui 
 from qfluentwidgets import qconfig, CardWidget, HollowHandleStyle
 
 from backend.config import config, tr
+
+
+class AspectRatioWidget(QWidget):
+    """A resizable 16:9 surface that can shrink on short screens."""
+
+    def __init__(self, parent=None, ratio=16 / 9):
+        super().__init__(parent)
+        self._ratio = ratio
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return max(1, round(width / self._ratio))
+
+    def sizeHint(self):
+        return QSize(640, 360)
+
+    def minimumSizeHint(self):
+        return QSize(240, 135)
+
 
 class VideoDisplayComponent(QWidget):
     """视频显示组件，包含视频预览和选择框功能"""
@@ -96,7 +118,10 @@ class VideoDisplayComponent(QWidget):
             border-top-right-radius: 10px;
             border: 0px solid transparent;
         """)
-        self.video_display.setMinimumSize(self.video_preview_width, self.video_preview_height)
+        # The old 640/960 px hard minimum made the main page taller than the
+        # available desktop and pushed its action buttons off-screen.
+        self.video_display.setMinimumSize(0, 0)
+        self.video_display.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         
         self.video_display.setMouseTracking(True)
         self.video_display.setScaledContents(True)
@@ -122,27 +147,14 @@ class VideoDisplayComponent(QWidget):
         self.video_display.setObjectName('videoDisplay')
         # black_layout.addWidget(self.video_display, 0, Qt.AlignCenter)
         # 创建一个容器来保持比例
-        ratio_container = QWidget()
+        ratio_container = AspectRatioWidget(self)
+        self.ratio_container = ratio_container
         ratio_layout = QVBoxLayout(ratio_container)
         ratio_layout.setContentsMargins(0, 0, 0, 0)
         ratio_layout.addWidget(self.video_display)
 
-        # 设置固定的宽高比
-        ratio_container.setFixedHeight(ratio_container.width() * 9 // 16)
-        ratio_container.setMinimumWidth(self.video_preview_width)
-
         # 添加到布局
-        black_layout.addWidget(ratio_container)
-
-        # 添加一个事件过滤器来处理大小变化
-        class RatioEventFilter(QObject):
-            def eventFilter(self, obj, event):
-                if event.type() == QEvent.Resize:
-                    obj.setFixedHeight(obj.width() * 9 // 16)
-                return False
-
-        ratio_filter = RatioEventFilter(ratio_container)
-        ratio_container.installEventFilter(ratio_filter)
+        black_layout.addWidget(ratio_container, 1)
 
         # 进度条和滑块容器
         control_container = QWidget(self)

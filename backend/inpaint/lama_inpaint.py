@@ -7,6 +7,7 @@ from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
 from backend import config
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.torch_inference import cuda_autocast
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -20,7 +21,7 @@ class LamaInpaint:
         else:
             orig_height, orig_width = np.array(image).shape[:2]
         image, mask = prepare_img_and_mask(image, mask, self.device)
-        with torch.inference_mode():
+        with torch.inference_mode(), cuda_autocast(self.device):
             inpainted = self.model(image, mask)
             cur_res = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
             cur_res = np.clip(cur_res * 255, 0, 255).astype('uint8')
@@ -51,7 +52,7 @@ class LamaInpaint:
             mask_tensor = torch.from_numpy(padded_masks).to(self.device)
             mask_tensor = (mask_tensor > 0) * 1
 
-            with torch.inference_mode():
+            with torch.inference_mode(), cuda_autocast(self.device):
                 inpainted = self.model(img_tensor, mask_tensor)
                 batch_results = inpainted.permute(0, 2, 3, 1).detach().cpu().numpy()
                 batch_results = np.clip(batch_results * 255, 0, 255).astype('uint8')

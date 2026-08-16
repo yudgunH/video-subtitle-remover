@@ -24,6 +24,38 @@ def parse_args():
         choices=[mode.name.lower().replace('_','-') for mode in InpaintMode],
         help="Inpaint mode, default is sttn-auto"
     )
+    parser.add_argument(
+        "--remove-chinese-text", "--remove-cjk-text",
+        dest="remove_cjk_text", action="store_true",
+        help=(
+            "Remove all detected text inside -c/--subtitle-area-coords and "
+            "only confirmed Chinese text elsewhere"
+        )
+    )
+    parser.add_argument(
+        "--translate-non-subtitle-chinese", "--translate-non-subtitle-cjk",
+        dest="translate_non_subtitle_cjk", action="store_true",
+        help=(
+            "Translate confirmed Chinese text outside -c/--subtitle-area-coords with 9Router. "
+            "Set the secret in VSR_9ROUTER_API_KEY."
+        ),
+    )
+    parser.add_argument(
+        "--translation-target-language", default="Vietnamese",
+        choices=[
+            "Vietnamese", "English", "Simplified Chinese", "Japanese",
+            "Korean", "Spanish",
+        ],
+        help="Target language for translated on-screen text",
+    )
+    parser.add_argument(
+        "--nine-router-base-url", default="https://9router.hbfstudio.site/v1",
+        help="9Router OpenAI-compatible base URL",
+    )
+    parser.add_argument(
+        "--nine-router-model", default="auto",
+        help="Model identifier routed by 9Router",
+    )
     args = parser.parse_args()
     args.inpaint_mode = InpaintMode[args.inpaint_mode.replace('-','_').upper()]
     if args.subtitle_area_coords is None:

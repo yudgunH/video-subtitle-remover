@@ -20,6 +20,8 @@ It mainly implements the following functionalities:
 - Fills in the removed subtitle text area using a powerful AI algorithm model (non-adjacent pixel filling and mosaic removal)
 - Supports custom subtitle positions by only removing subtitles in the defined location (input position)
 - Supports automatic removal of all text throughout the entire video (without inputting a position)
+- Removes every detected text box inside selected caption zones, conservatively removes only confirmed Chinese text elsewhere, then optionally translates that outside Chinese text through 9Router
+- Saves crash-safe OCR checkpoints every 300 frames; retrying the same video and settings resumes the scan instead of starting over
 - Supports multi-selection of images for batch removal of watermark text
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)
@@ -78,6 +80,21 @@ options:
                         Subtitle area coordinates (ymin ymax xmin xmax). Can be specified multiple times for multiple areas.
   --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv}
                         Inpaint mode, default is sttn-auto
+  --remove-chinese-text Remove all text inside -c caption zones and confirmed Chinese elsewhere
+  --translate-non-subtitle-chinese
+                        Translate confirmed Chinese text outside -c subtitle zones through 9Router
+  --translation-target-language {Vietnamese,English,Simplified Chinese,Japanese,Korean,Spanish}
+  --nine-router-base-url NINE_ROUTER_BASE_URL
+  --nine-router-model NINE_ROUTER_MODEL
+```
+
+**9Router translation (GUI):** Open Advanced Settings → 9Router Translation, enter the endpoint, model, and API key, then test the connection. On the home page enable “Translate non-subtitle Chinese text,” select the target language, and draw green rectangles over caption regions. Every detected text box inside those regions is removed; outside them, only confirmed Chinese is removed and translated. The API key is stored in the operating-system credential vault, not in `config.json`.
+
+**9Router translation (CLI):** Put the API key in `VSR_9ROUTER_API_KEY`, for example:
+
+```powershell
+$env:VSR_9ROUTER_API_KEY="your-9router-key"
+python backend/main.py -i input.mp4 -o output.mp4 -c 580 720 0 1280 --translate-non-subtitle-chinese --translation-target-language Vietnamese --nine-router-base-url https://9router.hbfstudio.site/v1 --nine-router-model auto
 ```
 ## Demonstration
 
@@ -92,16 +109,16 @@ options:
 
 #### 1. Install Python
 
-Please ensure that you have installed Python 3.12+.
+Please ensure that you have installed Python 3.11 or 3.12.
 
 - Windows users can go to the [Python official website](https://www.python.org/downloads/windows/) to download and install Python.
 - MacOS users can install using Homebrew:
   ```shell
-  brew install python@3.12
+  brew install python@3.11
   ```
 - Linux users can install via the package manager, such as on Ubuntu/Debian:
   ```shell
-  sudo apt update && sudo apt install python3.12 python3.12-venv python3.12-dev
+  sudo apt update && sudo apt install python3.11 python3.11-venv python3.11-dev
   ```
 
 #### 2. Install Dependencies

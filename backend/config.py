@@ -19,6 +19,15 @@ PROJECT_UPDATE_URLS = [
 # 硬件加速选项开关
 HARDWARD_ACCELERATION_OPTION = True
 
+TRANSLATION_LANGUAGE_OPTIONS = {
+    "Tiếng Việt": "Vietnamese",
+    "English": "English",
+    "简体中文": "Simplified Chinese",
+    "日本語": "Japanese",
+    "한국어": "Korean",
+    "Español": "Spanish",
+}
+
 class Config(QConfig):
     # 界面语言设置
     intefaceTexts = {
@@ -35,8 +44,8 @@ class Config(QConfig):
     # 窗口位置和大小
     windowX = ConfigItem("Window", "X", None)
     windowY = ConfigItem("Window", "Y", None)
-    windowW = ConfigItem("Window", "Width", 1200)
-    windowH = ConfigItem("Window", "Height", 1200)
+    windowW = ConfigItem("Window", "Width", 1280)
+    windowH = ConfigItem("Window", "Height", 820)
 
     # 使用一个配置项存储所有选区
     # 默认值为一个选区，格式为："ymin,ymax,xmin,xmax;ymin,ymax,xmin,xmax;..."，分号分隔不同选区
@@ -53,6 +62,27 @@ class Config(QConfig):
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
     
     subtitleDetectMode =  OptionsConfigItem("Main", "SubtitleDetectMode", SubtitleDetectMode.PP_OCRv5_SERVER, OptionsValidator(SubtitleDetectMode), EnumSerializer(SubtitleDetectMode))
+
+    # Hybrid removal: all detected text inside selected caption areas and only
+    # conservatively confirmed Chinese text elsewhere. Legacy CJK config keys
+    # are retained so existing user settings remain compatible.
+    removeCjkText = ConfigItem("Main", "RemoveCjkText", False, BoolValidator())
+    translateNonSubtitleCjk = ConfigItem(
+        "Main", "TranslateNonSubtitleCjk", False, BoolValidator()
+    )
+    translationTargetLanguage = OptionsConfigItem(
+        "Translation", "TargetLanguage", "Vietnamese",
+        OptionsValidator(TRANSLATION_LANGUAGE_OPTIONS.values()),
+    )
+    # Trusted caption areas: remove every detected text box here and exclude
+    # these areas from translation; outside them, require confirmed Chinese.
+    translationSubtitleExclusionAreas = ConfigItem(
+        "Translation", "SubtitleExclusionAreas", "0.82,0.99,0.05,0.95"
+    )
+    nineRouterBaseUrl = ConfigItem(
+        "Translation", "NineRouterBaseUrl", "https://9router.hbfstudio.site/v1"
+    )
+    nineRouterModel = ConfigItem("Translation", "NineRouterModel", "auto")
 
     # 【设置像素点偏差】
     # 用于判断是不是非字幕区域(一般认为字幕文本框的长度是要大于宽度的，如果字幕框的高大于宽，且大于的幅度超过指定像素点大小，则认为是错误检测)

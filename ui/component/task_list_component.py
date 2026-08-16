@@ -25,6 +25,8 @@ class TaskStatus(Enum):
 class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
+    TRANSLATION_EXCLUDE_AREAS = "translation_exclude_areas"
+    TRANSLATION_API_KEY = "translation_api_key"
 
 @dataclass
 class Task:
@@ -99,6 +101,11 @@ class TaskListComponent(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        # Keep the queue useful without forcing the action bar below short
+        # desktop viewports. The table itself remains scrollable.
+        self.table.setMinimumHeight(120)
         
         # 连接信号
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)

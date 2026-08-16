@@ -20,11 +20,24 @@ from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
 from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
-from backend.tools.inpaint_tools import create_mask, batch_generator, expand_frame_ranges
+from backend.tools.inpaint_tools import (
+    create_mask,
+    create_caption_text_union_mask,
+    create_chinese_text_mask,
+    create_chinese_text_union_mask,
+    composite_with_feather,
+    batch_generator,
+    expand_frame_ranges,
+)
 from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.subtitle_detect import SubtitleDetect
 from backend.tools.video_io import FramePrefetcher, FFmpegVideoWriter
+from backend.tools.text_translation import (
+    NineRouterTranslator,
+    TranslationPlan,
+    build_translation_tracks,
+)
 import tempfile
 import multiprocessing
 import time
@@ -85,6 +98,12 @@ class SubtitleRemover:
         self.progress_listeners = []
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
+        # API translation settings are populated by the GUI worker or CLI.
+        self.translation_api_key = ""
+        self.translation_exclude_areas = []
+        self.caption_areas = []
+        self.translation_plan = None
+        self.translation_client = None
 
     @staticmethod
     def is_current_frame_no_start(frame_no, continuous_frame_no_list):
@@ -156,16 +175,36 @@ class SubtitleRemover:
         """
         pass
 
+    @staticmethod
+    def resolve_processing_areas(sub_areas, frame_height, frame_width, remove_cjk_text=False):
+        """Return the effective pixel areas for the selected processing mode."""
+        if remove_cjk_text or not sub_areas:
+            return [(0, frame_height, 0, frame_width)]
+        return list(sub_areas)
+
     def propainter_mode(self, tbar):
-        sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-        sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
-        if len(sub_list) == 0:
-            raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
-        continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
-        scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
-        continuous_frame_no_list = sub_detector.split_range_by_scene(continuous_frame_no_list,
-                                                                          scene_div_points)
-        del sub_detector
+        sub_detector = SubtitleDetect(
+            self.video_path,
+            self.sub_areas,
+            caption_areas=(
+                self.caption_areas
+                if config.removeCjkText.value
+                or config.translateNonSubtitleCjk.value
+                else []
+            ),
+        )
+        try:
+            sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
+            if len(sub_list) == 0:
+                raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
+            scene_div_points = sub_detector.get_scene_div_frame_no(self.video_path)
+            continuous_frame_no_list = sub_detector.split_range_by_scene(
+                continuous_frame_no_list,
+                scene_div_points,
+            )
+        finally:
+            sub_detector.release_models()
         gc.collect()        
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
         propainter_inpaint = PropainterInpaint(device, self.model_config.PROPAINTER_MODEL_DIR, config.propainterMaxLoadNum.value)
@@ -258,17 +297,34 @@ class SubtitleRemover:
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
 
     def video_inpaint(self, tbar, model):
-        sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-        sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
-        if len(sub_list) == 0:
-            raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
-        continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
+        sub_detector = SubtitleDetect(
+            self.video_path,
+            self.sub_areas,
+            # Normal caption OCR results are unchanged by line-mask recovery,
+            # so keep its existing checkpoint fingerprint reusable.
+            caption_areas=(
+                self.caption_areas
+                if config.removeCjkText.value
+                or config.translateNonSubtitleCjk.value
+                else []
+            ),
+        )
+        translation_records = {}
+        sample_step = sub_detector.SAMPLE_STEP
+        try:
+            sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
+            if len(sub_list) == 0:
+                raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
+            continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
+            translation_records = dict(sub_detector.cjk_text_by_frame)
+        finally:
+            sub_detector.release_models()
+        self._prepare_translation_plan(translation_records, sample_step)
         tbar.write(f"Subtitle detected: {continuous_frame_no_list}")
         continuous_frame_no_list = expand_frame_ranges(continuous_frame_no_list, config.subtitleTimelineBackwardFrameCount.value, config.subtitleTimelineForwardFrameCount.value)
         tbar.write(f"Subtitle timeline expand ({config.subtitleTimelineBackwardFrameCount.value} <- -> {config.subtitleTimelineForwardFrameCount.value}): {continuous_frame_no_list}")
         continuous_frame_no_list = sub_detector.filter_and_merge_intervals(continuous_frame_no_list, config.sttnReferenceLength.value)
         tbar.write(f'Subtitle filter_and_merge_intervals: {continuous_frame_no_list}')
-        del sub_detector
         gc.collect()
         start_end_map = dict()
         for start, end in continuous_frame_no_list:
@@ -286,10 +342,11 @@ class SubtitleRemover:
             current_frame_index += 1
             # 判断当前帧号是不是字幕区间开始, 如果不是，则直接写
             if current_frame_index not in start_end_map.keys():
-                self.video_writer.write(frame)
+                output_frame = self._render_translation(frame, current_frame_index)
+                self.video_writer.write(output_frame)
                 # self.append_output(f'write frame: {current_frame_index}')
                 self.update_progress(tbar, increment=1)
-                self.update_preview_with_comp(frame, frame)
+                self.update_preview_with_comp(frame, output_frame)
             # 如果是区间开始，则找到尾巴
             else:
                 start_frame_index = current_frame_index
@@ -307,8 +364,13 @@ class SubtitleRemover:
                     current_frame_index += 1
                     frames_need_inpaint.append(frame)
                 mask_area_coordinates = []
+                caption_area_coordinates = []
+                caption_mask_references = []
+                seen_caption_references = set()
+                chinese_mask_references = []
+                seen_chinese_references = set()
                 # 1. 获取当前批次的mask坐标全集
-                for mask_index in range(start_frame_index, end_frame_index):
+                for mask_index in range(start_frame_index, end_frame_index + 1):
                     if mask_index in sub_list.keys():
                         for area in sub_list[mask_index]:
                             xmin, xmax, ymin, ymax = area
@@ -317,27 +379,232 @@ class SubtitleRemover:
                                 continue
                             if area not in mask_area_coordinates:
                                 mask_area_coordinates.append(area)
-                # 1. 获取当前批次使用的mask
-                mask = create_mask(self.mask_size, mask_area_coordinates)
+                            if (
+                                SubtitleDetect._box_center_in_areas(
+                                    area, self.caption_areas
+                                )
+                                and area not in caption_area_coordinates
+                            ):
+                                caption_area_coordinates.append(area)
+                                frame_offset = mask_index - start_frame_index
+                                if (
+                                    area not in seen_caption_references
+                                    and 0 <= frame_offset < len(frames_need_inpaint)
+                                ):
+                                    seen_caption_references.add(area)
+                                    caption_mask_references.append(
+                                        (frames_need_inpaint[frame_offset], area)
+                                    )
+                    for record in translation_records.get(mask_index, []):
+                        area = tuple(record["box"])
+                        xmin, xmax, ymin, ymax = area
+                        if (ymax - ymin) - (xmax - xmin) > config.subtitleYXAxisDifferencePixel.value:
+                            continue
+                        reference_key = (str(record.get("text", "")), area)
+                        if reference_key in seen_chinese_references:
+                            continue
+                        frame_offset = mask_index - start_frame_index
+                        if 0 <= frame_offset < len(frames_need_inpaint):
+                            seen_chinese_references.add(reference_key)
+                            chinese_mask_references.append(
+                                (frames_need_inpaint[frame_offset], area)
+                            )
+                caption_mask = create_caption_text_union_mask(
+                    [
+                        (reference_frame, [area])
+                        for reference_frame, area in caption_mask_references
+                    ],
+                    self.caption_areas,
+                    size=self.mask_size,
+                )
+                # Chinese-only mode uses stroke masks so diagrams or hardware
+                # inside a valid OCR rectangle are not erased with the text.
+                if config.removeCjkText.value or config.translateNonSubtitleCjk.value:
+                    chinese_mask = create_chinese_text_union_mask(
+                        [
+                            (reference_frame, [area])
+                            for reference_frame, area in chinese_mask_references
+                        ],
+                        size=self.mask_size,
+                    )
+                    mask = cv2.bitwise_or(chinese_mask, caption_mask)
+                    model_mask = create_mask(
+                        self.mask_size,
+                        mask_area_coordinates or [
+                            area for _, area in chinese_mask_references
+                        ],
+                    )
+                    # The inference mask must cover the line expansion too;
+                    # otherwise compositing would copy unchanged source pixels
+                    # from outside the original partial OCR rectangle.
+                    model_mask = cv2.bitwise_or(
+                        model_mask,
+                        cv2.dilate(
+                            caption_mask,
+                            cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE, (21, 21)
+                            ),
+                        ),
+                    )
+                else:
+                    # Ordinary selected-area caption removal needs the same
+                    # complete-line recovery. Previously this branch kept the
+                    # tight OCR rectangle and left letters on both ends.
+                    if np.any(caption_mask):
+                        mask = caption_mask
+                        model_mask = cv2.bitwise_or(
+                            create_mask(
+                                self.mask_size, mask_area_coordinates
+                            ),
+                            cv2.dilate(
+                                caption_mask,
+                                cv2.getStructuringElement(
+                                    cv2.MORPH_ELLIPSE, (21, 21)
+                                ),
+                            ),
+                        )
+                    else:
+                        mask = create_mask(
+                            self.mask_size, mask_area_coordinates
+                        )
+                        model_mask = mask
                 # self.append_output(f'inpaint with mask: {mask_area_coordinates}')
                 for batch in batch_generator(frames_need_inpaint, config.getSttnMaxLoadNum()):
                     # 2. 调用批推理
                     if len(batch) >= 1:
-                        inpainted_frames = model(batch, mask)
+                        if isinstance(model, STTNDetInpaint):
+                            inpainted_frames = model(
+                                batch, model_mask, composite_mask=mask
+                            )
+                        else:
+                            inpainted_frames = model(batch, mask)
                         for i, inpainted_frame in enumerate(inpainted_frames):
-                            self.video_writer.write(inpainted_frame)
+                            output_frame_no = start_frame_index + inner_index
+                            output_frame = self._render_translation(
+                                inpainted_frame, output_frame_no
+                            )
+                            self.video_writer.write(output_frame)
                             # self.append_output(f'write frame: {start_frame_index + inner_index} with mask')
                             inner_index += 1
-                            self.update_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                            self.update_preview_with_comp(
+                                np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8),
+                                output_frame,
+                            )
                     self.update_progress(tbar, increment=len(batch))
         reader.stop()
+
+    def _prepare_translation_plan(self, records_by_frame, sample_step):
+        if not config.translateNonSubtitleCjk.value:
+            self.translation_plan = None
+            return
+        tracks = build_translation_tracks(
+            records_by_frame,
+            exclusion_areas=self.translation_exclude_areas,
+            sample_step=sample_step,
+            total_frames=self.frame_count,
+        )
+        if not tracks:
+            self.append_output(tr['Main']['TranslationNoText'])
+            self.translation_plan = TranslationPlan([])
+            return
+
+        self.append_output(tr['Main']['TranslationStart'].format(len(tracks)))
+        translator = self.translation_client or NineRouterTranslator(
+            config.nineRouterBaseUrl.value,
+            self.translation_api_key,
+            config.nineRouterModel.value,
+            config.translationTargetLanguage.value,
+        )
+        translations = translator.translate_many([track.source_text for track in tracks])
+        for track in tracks:
+            track.translated_text = translations.get(track.source_text, "")
+        self.translation_plan = TranslationPlan(tracks)
+        self.append_output(tr['Main']['TranslationFinished'].format(len(tracks)))
+
+    def _render_translation(self, frame, frame_no):
+        if self.translation_plan is None:
+            return frame
+        return self.translation_plan.render(frame, frame_no)
 
     def run(self):
         # 记录开始时间
         start_time = time.time()
-        if len(self.sub_areas) == 0:
+        translate_non_subtitle = config.translateNonSubtitleCjk.value
+        remove_cjk_text = config.removeCjkText.value or translate_non_subtitle
+        if translate_non_subtitle:
+            if not self.translation_api_key:
+                self.translation_api_key = os.getenv("VSR_9ROUTER_API_KEY", "").strip()
+            if not self.translation_api_key:
+                raise RuntimeError(tr['Main']['TranslationApiKeyMissing'])
+            # Fail before the expensive OCR/inpainting pass if the router is
+            # unavailable or the credential is invalid.
+            self.translation_client = NineRouterTranslator(
+                config.nineRouterBaseUrl.value,
+                self.translation_api_key,
+                config.nineRouterModel.value,
+                config.translationTargetLanguage.value,
+            )
+            available_models = self.translation_client.list_models()
+            if not available_models:
+                raise RuntimeError(tr['Main']['TranslationNoModels'])
+            self.translation_client.model = (
+                self.translation_client.find_working_translation_model(
+                    available_models
+                )
+            )
+            self.append_output(
+                tr['Main']['TranslationRouterReady'].format(
+                    self.translation_client.model
+                )
+            )
+            if not self.translation_exclude_areas:
+                # Preserve the user's selected subtitle zone before Chinese mode
+                # expands OCR/inpainting to the complete frame.
+                self.translation_exclude_areas = list(self.sub_areas)
+            self.append_output(
+                tr['Main']['TranslationExclusionArea'].format(
+                    self.translation_exclude_areas
+                )
+            )
+        if remove_cjk_text:
+            # Chinese removal is a full-frame feature. Ignore any subtitle box
+            # restored from the GUI so detection, logs, and future inpainting
+            # implementations all use the same explicit processing area.
+            if not self.caption_areas:
+                self.caption_areas = list(
+                    self.translation_exclude_areas or self.sub_areas
+                )
+            # A synthetic full-frame rectangle is a processing indicator, not
+            # a trusted caption zone. Treat it as no caption selection.
+            self.caption_areas = [
+                area for area in self.caption_areas
+                if not (
+                    area[0] <= 0 and area[2] <= 0
+                    and area[1] >= self.frame_height
+                    and area[3] >= self.frame_width
+                )
+            ]
+            if translate_non_subtitle:
+                self.translation_exclude_areas = list(self.caption_areas)
+            self.sub_areas = self.resolve_processing_areas(
+                self.sub_areas, self.frame_height, self.frame_width, True
+            )
+        elif len(self.sub_areas) == 0:
             self.append_output(tr['Main']['FullScreenProcessingNote'])
-            self.sub_areas.append((0, self.frame_height, 0, self.frame_width))
+            self.sub_areas = self.resolve_processing_areas(
+                self.sub_areas, self.frame_height, self.frame_width, False
+            )
+        else:
+            # In normal detection mode the selected green rectangles are
+            # trusted caption zones. Enable complete-line mask recovery there.
+            self.caption_areas = [
+                area for area in self.sub_areas
+                if not (
+                    area[0] <= 0 and area[2] <= 0
+                    and area[1] >= self.frame_height
+                    and area[3] >= self.frame_width
+                )
+            ]
         self.append_output(tr['Main']['SubtitleArea'].format(self.sub_areas))
         self.append_output(tr['Main']['ABSection'].format(str(self.ab_sections).replace("range", "") if self.ab_sections is not None and len(self.ab_sections) > 0 else tr['Main']['ABSectionAll']))
         # 如果使用GPU加速，则打印GPU加速提示
@@ -355,35 +622,103 @@ class SubtitleRemover:
             if original_frame is None:
                 self.append_output(tr['Main']['ReadImageFailed'].format(self.video_path))
                 return
-            sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-            sub_list = sub_detector.detect_subtitle(original_frame)
-            del sub_detector
+            sub_detector = SubtitleDetect(
+                self.video_path, self.sub_areas,
+                caption_areas=self.caption_areas,
+            )
+            translation_records = []
+            try:
+                sub_list = sub_detector.detect_subtitle(original_frame)
+                translation_records = list(sub_detector.last_cjk_records)
+            finally:
+                sub_detector.release_models()
+            self._prepare_translation_plan(
+                {1: translation_records} if translation_records else {}, 1
+            )
             gc.collect()
             if len(sub_list):
-                mask = create_mask(original_frame.shape[0:2], sub_list)
-                inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
-                self.update_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                model_mask = create_mask(original_frame.shape[0:2], sub_list)
+                if remove_cjk_text:
+                    caption_boxes = [
+                        area for area in sub_list
+                        if SubtitleDetect._box_center_in_areas(
+                            area, self.caption_areas
+                        )
+                    ]
+                    chinese_boxes = [
+                        record["box"] for record in translation_records
+                    ]
+                    mask = cv2.bitwise_or(
+                        create_chinese_text_mask(
+                            original_frame, chinese_boxes
+                        ),
+                        create_caption_text_union_mask(
+                            [(original_frame, caption_boxes)],
+                            self.caption_areas,
+                            size=original_frame.shape[:2],
+                        ),
+                    )
+                    generated = self.lama_inpaint.inpaint(
+                        original_frame, model_mask
+                    )
+                    inpainted_frame = composite_with_feather(
+                        original_frame, generated, mask
+                    )
+                else:
+                    if self.caption_areas:
+                        mask = create_caption_text_union_mask(
+                            [(original_frame, sub_list)],
+                            self.caption_areas,
+                            size=original_frame.shape[:2],
+                        )
+                        model_mask = cv2.bitwise_or(
+                            model_mask,
+                            cv2.dilate(
+                                mask,
+                                cv2.getStructuringElement(
+                                    cv2.MORPH_ELLIPSE, (21, 21)
+                                ),
+                            ),
+                        )
+                        generated = self.lama_inpaint.inpaint(
+                            original_frame, model_mask
+                        )
+                        inpainted_frame = composite_with_feather(
+                            original_frame, generated, mask
+                        )
+                    else:
+                        mask = model_mask
+                        inpainted_frame = self.lama_inpaint.inpaint(
+                            original_frame, mask
+                        )
+                preview_source = np.clip(
+                    original_frame + mask[:, :, np.newaxis] * 0.3, 0, 255
+                ).astype(np.uint8)
             else:
                 inpainted_frame = original_frame
-                self.update_preview_with_comp(original_frame, inpainted_frame)
+                preview_source = original_frame
+            inpainted_frame = self._render_translation(inpainted_frame, 1)
+            self.update_preview_with_comp(preview_source, inpainted_frame)
             cv2.imencode(self.ext, inpainted_frame)[1].tofile(self.video_out_path)
             tbar.update(1)
             self.progress_total = 100
         else:
             # 精准模式下，获取场景分割的帧号，进一步切割
             self.log_model()
-            if config.inpaintMode.value == InpaintMode.PROPAINTER:
+            effective_inpaint_mode = self.effective_inpaint_mode
+
+            if effective_inpaint_mode == InpaintMode.PROPAINTER:
                 self.propainter_mode(tbar)
-            elif config.inpaintMode.value == InpaintMode.STTN_AUTO:
+            elif effective_inpaint_mode == InpaintMode.STTN_AUTO:
                 self.sttn_auto_mode(tbar)
-            elif config.inpaintMode.value == InpaintMode.STTN_DET:
+            elif effective_inpaint_mode == InpaintMode.STTN_DET:
                 self.video_inpaint(tbar, self.sttn_det_inpaint)
-            elif config.inpaintMode.value == InpaintMode.LAMA:
+            elif effective_inpaint_mode == InpaintMode.LAMA:
                 self.video_inpaint(tbar, self.lama_inpaint)
-            elif config.inpaintMode.value == InpaintMode.OPENCV:
+            elif effective_inpaint_mode == InpaintMode.OPENCV:
                 self.video_inpaint(tbar, OpenCVInpaint())
             else:
-                raise Exception(f'inpaint mode: {config.inpaintMode.value} not implemented')
+                raise Exception(f'inpaint mode: {effective_inpaint_mode} not implemented')
 
         self.video_cap.release()
         self.video_writer.release()
@@ -400,12 +735,23 @@ class SubtitleRemover:
             except Exception:
                 pass #ignore
 
+    @property
+    def effective_inpaint_mode(self):
+        mode = config.inpaintMode.value
+        if config.translateNonSubtitleCjk.value or config.removeCjkText.value:
+            # Translation overlays currently use the OCR timeline produced by
+            # the detection path. Chinese-only removal also depends on STTN's
+            # separate inference/composite masks, so keep this deterministic.
+            return InpaintMode.STTN_DET
+        return mode
+
     def log_model(self):
-        model_friendly_name = list(tr['InpaintMode'].values())[list(InpaintMode).index(config.inpaintMode.value)]
+        effective_inpaint_mode = self.effective_inpaint_mode
+        model_friendly_name = list(tr['InpaintMode'].values())[list(InpaintMode).index(effective_inpaint_mode)]
         model_device = 'CPU'
-        if config.inpaintMode.value != InpaintMode.OPENCV and self.hardware_accelerator.has_accelerator():
+        if effective_inpaint_mode != InpaintMode.OPENCV and self.hardware_accelerator.has_accelerator():
             accelerator_name = self.hardware_accelerator.accelerator_name
-            if accelerator_name == 'DirectML' and config.inpaintMode.value in [InpaintMode.STTN_AUTO, InpaintMode.STTN_DET]:
+            if accelerator_name == 'DirectML' and effective_inpaint_mode in [InpaintMode.STTN_AUTO, InpaintMode.STTN_DET]:
                 model_device = 'DirectML'
             if self.hardware_accelerator.has_cuda() or self.hardware_accelerator.has_mps():
                 model_device = accelerator_name
@@ -478,12 +824,22 @@ if __name__ == '__main__':
     config.set(config.interface, 'en')
     TRANSLATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'interface', f"{config.interface.value}.ini")
     tr.read(TRANSLATION_FILE, encoding='utf-8')
-    sr = SubtitleRemover(args.input)
     if not is_video_or_image(args.input):
-        sr.append_output(f'Error: {video_path} is not supported not corrupted.')
+        print(f'Error: {args.input} is not supported or is corrupted.')
         exit(-1)
+    sr = SubtitleRemover(args.input)
     sr.sub_areas = args.subtitle_area_coords
-    sr.video_out_path = args.output
+    if args.output:
+        sr.video_out_path = args.output
     config.inpaintMode.value = args.inpaint_mode
+    config.set(config.removeCjkText, args.remove_cjk_text)
+    config.set(config.translateNonSubtitleCjk, args.translate_non_subtitle_cjk)
+    config.set(config.translationTargetLanguage, args.translation_target_language)
+    config.set(config.nineRouterBaseUrl, args.nine_router_base_url)
+    config.set(config.nineRouterModel, args.nine_router_model)
+    if args.translate_non_subtitle_cjk:
+        # In translation mode, -c marks subtitle zones that must remain untouched.
+        sr.translation_exclude_areas = list(args.subtitle_area_coords)
+        sr.translation_api_key = os.getenv("VSR_9ROUTER_API_KEY", "").strip()
     sr.run()
         

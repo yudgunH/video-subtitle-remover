@@ -146,7 +146,10 @@ class Attention(nn.Module):
     def forward(self, query, key, value, m):
         scores = torch.matmul(query, key.transpose(-2, -1)
                               ) / math.sqrt(query.size(-1))
-        scores.masked_fill(m, -1e9)
+        # ``-1e9`` overflows under CUDA FP16 autocast.  Use the lowest value
+        # representable by the active attention dtype and keep the masked
+        # result (``masked_fill`` is not an in-place operation).
+        scores = scores.masked_fill(m, torch.finfo(scores.dtype).min)
         p_attn = F.softmax(scores, dim=-1)
         p_val = torch.matmul(p_attn, value)
         return p_val, p_attn

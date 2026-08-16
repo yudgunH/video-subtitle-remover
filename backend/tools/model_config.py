@@ -8,6 +8,11 @@ _MODEL_NAME_MAP = {
     SubtitleDetectMode.PP_OCRv5_SERVER: "PP-OCRv5_server_det",
 }
 
+_REC_MODEL_NAME_MAP = {
+    SubtitleDetectMode.PP_OCRv5_MOBILE: "PP-OCRv5_mobile_rec",
+    SubtitleDetectMode.PP_OCRv5_SERVER: "PP-OCRv5_server_rec",
+}
+
 class ModelConfig:
     def __init__(self):
         self.LAMA_MODEL_DIR = os.path.join(BASE_DIR, 'models', 'big-lama')
@@ -21,6 +26,7 @@ class ModelConfig:
         else:
             raise ValueError(f"Invalid subtitle detect mode: {config.subtitleDetectMode.value}")
         self.DET_MODEL_NAME = _MODEL_NAME_MAP[config.subtitleDetectMode.value]
+        self.REC_MODEL_NAME = _REC_MODEL_NAME_MAP[config.subtitleDetectMode.value]
 
-        merge_big_file_if_not_exists(self.LAMA_MODEL_DIR, 'bit-lama.pt')
+        merge_big_file_if_not_exists(self.LAMA_MODEL_DIR, 'big-lama.pt')
         merge_big_file_if_not_exists(self.PROPAINTER_MODEL_DIR, 'ProPainter.pth')

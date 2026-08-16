@@ -64,7 +64,10 @@ class SubtitleRemoverRemoteCall:
 
     @staticmethod
     def remote_call_catch_error(queue, e):
-        queue.put((Command.ERROR, (e,)))
+        # Third-party request exceptions do not reliably survive pickling
+        # between the worker and GUI processes (their URL may become None).
+        # The UI only displays the message, so send the stable text form.
+        queue.put((Command.ERROR, (str(e),)))
 
     @staticmethod
     def remote_call_manage_process(queue, pid):

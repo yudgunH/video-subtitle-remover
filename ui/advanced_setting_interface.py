@@ -10,6 +10,11 @@ from qfluentwidgets import (ScrollArea, ExpandLayout, CardWidget, SubtitleLabel,
                            HyperlinkCard, PrimaryPushSettingCard, PushSettingCard,
                            MessageBox)
 from backend.config import config, tr, VERSION, PROJECT_HOME_URL, PROJECT_ISSUES_URL, PROJECT_RELEASES_URL
+from backend.tools.secret_store import (
+    get_nine_router_api_key,
+    set_nine_router_api_key,
+)
+from backend.tools.text_translation import NineRouterTranslator
 from backend.tools.version_service import VersionService
 from backend.tools.concurrent import TaskExecutor
 
@@ -59,6 +64,12 @@ class AdvancedSettingInterface(ScrollArea):
         self.propainter_group.addSettingCard(self.propainter_max_load_num)
         self.expandLayout.addWidget(self.propainter_group)
 
+        self.translation_group.addSettingCard(self.nine_router_base_url)
+        self.translation_group.addSettingCard(self.nine_router_model)
+        self.translation_group.addSettingCard(self.nine_router_api_key)
+        self.translation_group.addSettingCard(self.nine_router_test)
+        self.expandLayout.addWidget(self.translation_group)
+
         self.advanced_group.addSettingCard(self.save_directory)
         self.advanced_group.addSettingCard(self.check_update_on_startup)
         self.expandLayout.addWidget(self.advanced_group)
@@ -79,6 +90,7 @@ class AdvancedSettingInterface(ScrollArea):
         self.sttn_group = SettingCardGroup(tr["Setting"]["SttnSetting"], self.scrollWidget)
         # Propainter设置组
         self.propainter_group = SettingCardGroup(tr["Setting"]["ProPainterSetting"], self.scrollWidget)
+        self.translation_group = SettingCardGroup(tr["Setting"]["TranslationSetting"], self.scrollWidget)
         # 高级设置组
         self.advanced_group = SettingCardGroup(tr["Setting"]["AdvancedSetting"], self.scrollWidget)
         # 关于设置组
@@ -172,6 +184,42 @@ class AdvancedSettingInterface(ScrollArea):
             parent=self.propainter_group
         )
 
+        self.nine_router_base_url = PushSettingCard(
+            text=tr["Setting"]["NineRouterEdit"],
+            icon=FluentIcon.GLOBE,
+            title=tr["Setting"]["NineRouterBaseUrl"],
+            content=config.nineRouterBaseUrl.value,
+            parent=self.translation_group,
+        )
+        self.nine_router_base_url.clicked.connect(self.edit_nine_router_base_url)
+
+        self.nine_router_model = PushSettingCard(
+            text=tr["Setting"]["NineRouterEdit"],
+            icon=FluentIcon.CLOUD,
+            title=tr["Setting"]["NineRouterModel"],
+            content=config.nineRouterModel.value,
+            parent=self.translation_group,
+        )
+        self.nine_router_model.clicked.connect(self.edit_nine_router_model)
+
+        self.nine_router_api_key = PushSettingCard(
+            text=tr["Setting"]["NineRouterSetKey"],
+            icon=FluentIcon.CERTIFICATE,
+            title=tr["Setting"]["NineRouterApiKey"],
+            content=self._api_key_status(),
+            parent=self.translation_group,
+        )
+        self.nine_router_api_key.clicked.connect(self.edit_nine_router_api_key)
+
+        self.nine_router_test = PrimaryPushSettingCard(
+            text=tr["Setting"]["NineRouterTest"],
+            icon=FluentIcon.SYNC,
+            title=tr["Setting"]["NineRouterTestTitle"],
+            content=tr["Setting"]["NineRouterTestDesc"],
+            parent=self.translation_group,
+        )
+        self.nine_router_test.clicked.connect(self.test_nine_router_connection)
+
         # 视频保存路径
         self.save_directory = PushSettingCard(
             text=tr["Setting"]["ChooseDirectory"],
@@ -230,6 +278,98 @@ class AdvancedSettingInterface(ScrollArea):
 
         if w.exec() and yesSlot is not None:
             yesSlot()
+
+    @staticmethod
+    def _api_key_status():
+        key = get_nine_router_api_key()
+        return (
+            tr["Setting"]["NineRouterApiKeyConfigured"]
+            if key else tr["Setting"]["NineRouterApiKeyMissing"]
+        )
+
+    def edit_nine_router_base_url(self):
+        value, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            tr["Setting"]["NineRouterBaseUrl"],
+            tr["Setting"]["NineRouterInputBaseUrl"],
+            QtWidgets.QLineEdit.Normal,
+            config.nineRouterBaseUrl.value,
+        )
+        value = value.strip()
+        if accepted and value:
+            config.set(config.nineRouterBaseUrl, value.rstrip("/"))
+            self.nine_router_base_url.setContent(config.nineRouterBaseUrl.value)
+
+    def edit_nine_router_model(self):
+        value, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            tr["Setting"]["NineRouterModel"],
+            tr["Setting"]["NineRouterInputModel"],
+            QtWidgets.QLineEdit.Normal,
+            config.nineRouterModel.value,
+        )
+        value = value.strip()
+        if accepted and value:
+            config.set(config.nineRouterModel, value)
+            self.nine_router_model.setContent(config.nineRouterModel.value)
+
+    def edit_nine_router_api_key(self):
+        value, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            tr["Setting"]["NineRouterApiKey"],
+            tr["Setting"]["NineRouterInputApiKey"],
+            QtWidgets.QLineEdit.Password,
+            "",
+        )
+        if accepted:
+            set_nine_router_api_key(value)
+            self.nine_router_api_key.setContent(self._api_key_status())
+
+    def test_nine_router_connection(self):
+        api_key = get_nine_router_api_key()
+        if not api_key:
+            self.show_message_box(
+                tr["Setting"]["NineRouterTestTitle"],
+                tr["Setting"]["NineRouterApiKeyMissing"],
+            )
+            return
+
+        self.nine_router_test.button.setEnabled(False)
+        translator = NineRouterTranslator(
+            config.nineRouterBaseUrl.value,
+            api_key,
+            config.nineRouterModel.value,
+            config.translationTargetLanguage.value,
+            timeout=15,
+        )
+
+        def test_router():
+            models = translator.list_models()
+            working_model = translator.find_working_translation_model(models)
+            return working_model, models
+
+        def on_success(result):
+            working_model, models = result
+            self.nine_router_test.button.setEnabled(True)
+            if models and config.nineRouterModel.value.casefold() == "auto":
+                config.set(config.nineRouterModel, working_model)
+                self.nine_router_model.setContent(config.nineRouterModel.value)
+            detail = working_model
+            self.show_message_box(
+                tr["Setting"]["NineRouterTestTitle"],
+                tr["Setting"]["NineRouterTestSuccess"].format(detail),
+            )
+
+        def on_failed(error):
+            self.nine_router_test.button.setEnabled(True)
+            self.show_message_box(
+                tr["Setting"]["NineRouterTestTitle"],
+                tr["Setting"]["NineRouterTestFailed"].format(str(error)),
+            )
+
+        self._router_test_future = TaskExecutor.runTask(test_router).then(
+            on_success, on_failed
+        )
 
     def check_update(self, ignore=False):
         """ check software update
